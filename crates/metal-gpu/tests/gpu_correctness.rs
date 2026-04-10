@@ -1,11 +1,19 @@
 use metal_gpu::MetalMiner;
+use std::path::PathBuf;
+use std::sync::LazyLock;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+static GTABLE_CACHE: LazyLock<PathBuf> = LazyLock::new(|| {
+    let dir = std::env::temp_dir().join("binohash_test");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("gtable.bin")
+});
+
 fn miner() -> MetalMiner {
-    MetalMiner::new(None).expect("Metal device and GTable should be available")
+    MetalMiner::new(Some(&GTABLE_CACHE)).expect("Metal device and GTable should be available")
 }
 
 #[test]
