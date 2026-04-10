@@ -6,6 +6,9 @@ use script::{find_and_delete, push_data, push_number};
 use subset::CombinationIter;
 use tx::Transaction;
 
+/// Callback type for modifying transactions during pinning search.
+pub type TxModifier<'a> = dyn Fn(&mut Transaction, u64) + Sync + 'a;
+
 /// Parameters for the pinning puzzle search.
 pub struct PinningSearchParams<'a> {
     /// The template transaction (sequence and locktime will be varied).
@@ -27,7 +30,7 @@ pub struct PinningSearchParams<'a> {
     /// Optional: additional transaction modifications per candidate.
     /// Called with (tx, candidate_offset) to vary outputs, OP_RETURN, etc.
     /// The modifier should be cheap and deterministic.
-    pub tx_modifier: Option<&'a (dyn Fn(&mut Transaction, u64) + Sync)>,
+    pub tx_modifier: Option<&'a TxModifier<'a>>,
 }
 
 /// Defines the (sequence, locktime) search space for pinning.
@@ -154,10 +157,10 @@ pub fn search_digest(params: DigestSearchParams<'_>) -> Option<DigestHit> {
         }
     }
     // Process remaining combos
-    if !combos.is_empty() {
-        if let Some(hit) = evaluate_chunk(&combos, &params, &base_script_code) {
-            return Some(hit);
-        }
+    if !combos.is_empty()
+        && let Some(hit) = evaluate_chunk(&combos, &params, &base_script_code)
+    {
+        return Some(hit);
     }
 
     None

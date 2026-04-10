@@ -86,21 +86,21 @@ pub fn nth_combination(n: usize, k: usize, mut index: u128) -> Option<Vec<usize>
     }
 
     let mut result = Vec::with_capacity(k);
-    let mut start = 0usize;
+    let mut next = 0usize;
     let mut remaining_k = k;
 
     for _ in 0..k {
-        // Find the smallest element `c` in [start, n - remaining_k] such that
-        // C(n - 1 - c, remaining_k - 1) <= index
-        for c in start..n {
+        let mut c = next;
+        loop {
             let count = binomial_coefficient(n - 1 - c, remaining_k - 1);
             if index < count {
                 result.push(c);
-                start = c + 1;
+                next = c + 1;
                 remaining_k -= 1;
                 break;
             }
             index -= count;
+            c += 1;
         }
     }
 
