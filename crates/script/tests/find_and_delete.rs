@@ -1,4 +1,7 @@
-use script::{find_and_delete, push_data, push_number, count_non_push_opcodes};
+use script::{
+    QsbConfig, build_full_script, count_non_push_opcodes, find_and_delete, push_data, push_number,
+    validate_script_limits,
+};
 
 #[test]
 fn removes_all_occurrences() {
@@ -139,4 +142,68 @@ fn count_non_push_opcodes_op_numbers_not_counted() {
     // OP_0 through OP_16 are NOT counted as non-push opcodes
     let s = vec![0x00, 0x51, 0x52, 0x60]; // OP_0, OP_1, OP_2, OP_16
     assert_eq!(count_non_push_opcodes(&s).unwrap(), 0);
+}
+
+#[test]
+fn config_a_respects_consensus_limits() {
+    use hors::{HorsKeys, NonceSig, generate_dummy_sigs};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    let config = QsbConfig::config_a();
+    let mut rng = ChaCha20Rng::seed_from_u64(42);
+
+    let hors0 = HorsKeys::generate(config.n, &mut rng);
+    let hors1 = HorsKeys::generate(config.n, &mut rng);
+    let dummy0 = generate_dummy_sigs(config.n, 0);
+    let dummy1 = generate_dummy_sigs(config.n, 1);
+
+    let pin_sig = NonceSig::derive("qsb_pin");
+    let round1_sig = NonceSig::derive("qsb_round1");
+    let round2_sig = NonceSig::derive("qsb_round2");
+
+    let full = build_full_script(
+        config,
+        &pin_sig.der_encoded,
+        &round1_sig.der_encoded,
+        &round2_sig.der_encoded,
+        &[hors0.commitments, hors1.commitments],
+        &[dummy0, dummy1],
+    );
+
+    validate_script_limits(&full).expect("Config A should fit within consensus limits");
+
+    let opcodes = count_non_push_opcodes(&full).unwrap();
+    assert!(opcodes <= 201, "Config A has {opcodes} non-push opcodes (max 201)");
+    assert!(full.len() <= 10_000, "Config A is {} bytes (max 10,000)", full.len());
+}
+
+#[test]
+fn test_config_respects_consensus_limits() {
+    use hors::{HorsKeys, NonceSig, generate_dummy_sigs};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    let config = QsbConfig::test();
+    let mut rng = ChaCha20Rng::seed_from_u64(42);
+
+    let hors0 = HorsKeys::generate(config.n, &mut rng);
+    let hors1 = HorsKeys::generate(config.n, &mut rng);
+    let dummy0 = generate_dummy_sigs(config.n, 0);
+    let dummy1 = generate_dummy_sigs(config.n, 1);
+
+    let pin_sig = NonceSig::derive("qsb_pin");
+    let round1_sig = NonceSig::derive("qsb_round1");
+    let round2_sig = NonceSig::derive("qsb_round2");
+
+    let full = build_full_script(
+        config,
+        &pin_sig.der_encoded,
+        &round1_sig.der_encoded,
+        &round2_sig.der_encoded,
+        &[hors0.commitments, hors1.commitments],
+        &[dummy0, dummy1],
+    );
+
+    validate_script_limits(&full).expect("test config should fit within consensus limits");
 }

@@ -356,6 +356,9 @@ dependencies = [
 name = "script"
 version = "0.1.0"
 dependencies = [
+ "hors",
+ "rand",
+ "rand_chacha",
  "thiserror",
 ]
 

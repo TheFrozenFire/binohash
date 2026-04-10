@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2"
+
+[dev-dependencies]
+hors = { path = "../hors" }
+rand = "0.9"
+rand_chacha = "0.9"

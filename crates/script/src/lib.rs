@@ -140,4 +140,187 @@ pub enum ScriptError {
     Truncated(&'static str),
     #[error("push data overruns script length")]
     PushOverrun,
+    #[error("script exceeds {limit} byte size limit ({actual} bytes)")]
+    SizeExceeded { limit: usize, actual: usize },
+    #[error("script exceeds {limit} non-push opcode limit ({actual} opcodes)")]
+    OpcodeExceeded { limit: usize, actual: usize },
+}
+
+/// QSB script configuration parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct QsbConfig {
+    /// Pool size (number of dummy sigs / HORS entries per round).
+    pub n: usize,
+    /// Number of signed selections in round 1.
+    pub t1_signed: usize,
+    /// Number of bonus selections in round 1.
+    pub t1_bonus: usize,
+    /// Number of signed selections in round 2.
+    pub t2_signed: usize,
+    /// Number of bonus selections in round 2.
+    pub t2_bonus: usize,
+}
+
+impl QsbConfig {
+    pub fn t1_total(self) -> usize {
+        self.t1_signed + self.t1_bonus
+    }
+
+    pub fn t2_total(self) -> usize {
+        self.t2_signed + self.t2_bonus
+    }
+
+    /// Config A from the paper: t=8+1b, 7+2b, n=150. Fits exactly 201 opcodes.
+    pub fn config_a() -> Self {
+        Self { n: 150, t1_signed: 8, t1_bonus: 1, t2_signed: 7, t2_bonus: 2 }
+    }
+
+    /// Small test config for integration testing.
+    pub fn test() -> Self {
+        Self { n: 20, t1_signed: 2, t1_bonus: 0, t2_signed: 2, t2_bonus: 0 }
+    }
+}
+
+/// Build the 5-opcode pinning section of the locking script.
+///
+/// Witness expects: `<key_puzzle> <key_nonce>` (key_nonce on top)
+pub fn build_pinning_script(sig_nonce: &[u8]) -> Vec<u8> {
+    let mut s = Vec::new();
+    s.extend_from_slice(&push_data(sig_nonce));
+    s.push(OP_OVER);
+    s.push(OP_CHECKSIGVERIFY);
+    s.push(OP_RIPEMD160);
+    s.push(OP_SWAP);
+    s.push(OP_CHECKSIGVERIFY);
+    s
+}
+
+/// Build a single round's script section.
+///
+/// Includes: HORS commitments, dummy sigs, OP_0, sig_nonce, selection logic,
+/// puzzle derivation, CHECKSIGVERIFY, and CHECKMULTISIG.
+pub fn build_round_script(
+    n: usize,
+    t_signed: usize,
+    t_bonus: usize,
+    sig_nonce: &[u8],
+    hors_commitments: &[[u8; 20]],
+    dummy_sigs: &[[u8; 9]],
+) -> Vec<u8> {
+    let t_total = t_signed + t_bonus;
+    let mut s = Vec::new();
+
+    // Push n HORS commitments (reversed order)
+    for commitment in hors_commitments.iter().rev() {
+        s.extend_from_slice(&push_data(commitment));
+    }
+    // Push n dummy sigs (reversed order)
+    for dummy in dummy_sigs.iter().rev() {
+        s.extend_from_slice(&push_data(dummy));
+    }
+    // OP_0 (CHECKMULTISIG dummy) + hardcoded sig_nonce
+    s.push(OP_0);
+    s.extend_from_slice(&push_data(sig_nonce));
+
+    // Signed selections (9 ops each)
+    for i in 0..t_signed {
+        let idx_pos = 2 * n + 1 - i;
+        let sanitize = n - i;
+        let preimage_pos = 2 * n + 1 + t_total - 2 * i;
+        s.extend_from_slice(&push_number(idx_pos as i64));
+        s.push(OP_ROLL);
+        s.extend_from_slice(&push_number(sanitize as i64));
+        s.push(OP_MIN);
+        s.push(OP_DUP);
+        s.extend_from_slice(&push_number((n + 1) as i64));
+        s.push(OP_ADD);
+        s.push(OP_ROLL);
+        s.extend_from_slice(&push_number(preimage_pos as i64));
+        s.push(OP_ROLL);
+        s.push(OP_HASH160);
+        s.push(OP_EQUALVERIFY);
+        s.push(OP_ROLL);
+    }
+
+    // Bonus selections (3 ops each)
+    for i in 0..t_bonus {
+        let j = t_signed + i;
+        let idx_pos = 2 * n + 1 - j;
+        let sanitize = n - j;
+        s.extend_from_slice(&push_number(idx_pos as i64));
+        s.push(OP_ROLL);
+        s.extend_from_slice(&push_number(sanitize as i64));
+        s.push(OP_MIN);
+        s.push(OP_ROLL);
+    }
+
+    // Puzzle: ROLL key_nonce + DUP + RIPEMD160
+    let puzzle_pos = 2 * n + 2;
+    s.extend_from_slice(&push_number(puzzle_pos as i64));
+    s.push(OP_ROLL);
+    s.push(OP_DUP);
+    s.push(OP_RIPEMD160);
+
+    // CHECKSIGVERIFY for sig_puzzle
+    s.extend_from_slice(&push_number(puzzle_pos as i64));
+    s.push(OP_ROLL);
+    s.push(OP_CHECKSIGVERIFY);
+
+    // CHECKMULTISIG (t+1)-of-(t+1)
+    let m = t_total + 1;
+    s.extend_from_slice(&push_number(m as i64));
+    s.push(OP_2);
+    s.push(OP_ROLL);
+
+    let cms_roll_pos = 2 * n + 3;
+    for _ in 0..t_total {
+        s.extend_from_slice(&push_number(cms_roll_pos as i64));
+        s.push(OP_ROLL);
+    }
+
+    s.extend_from_slice(&push_number(m as i64));
+    s.push(OP_CHECKMULTISIG);
+    s
+}
+
+/// Build the complete QSB locking script (pinning + 2 rounds).
+pub fn build_full_script(
+    config: QsbConfig,
+    pin_sig: &[u8],
+    round1_sig: &[u8],
+    round2_sig: &[u8],
+    hors_commitments: &[Vec<[u8; 20]>; 2],
+    dummy_sigs: &[Vec<[u8; 9]>; 2],
+) -> Vec<u8> {
+    let mut s = build_pinning_script(pin_sig);
+    s.extend_from_slice(&build_round_script(
+        config.n, config.t1_signed, config.t1_bonus,
+        round1_sig, &hors_commitments[0], &dummy_sigs[0],
+    ));
+    s.extend_from_slice(&build_round_script(
+        config.n, config.t2_signed, config.t2_bonus,
+        round2_sig, &hors_commitments[1], &dummy_sigs[1],
+    ));
+    s
+}
+
+/// Validate that a script fits within Bitcoin consensus limits.
+pub fn validate_script_limits(script: &[u8]) -> Result<(), ScriptError> {
+    const MAX_SCRIPT_SIZE: usize = 10_000;
+    const MAX_NON_PUSH_OPCODES: usize = 201;
+
+    if script.len() > MAX_SCRIPT_SIZE {
+        return Err(ScriptError::SizeExceeded {
+            limit: MAX_SCRIPT_SIZE,
+            actual: script.len(),
+        });
+    }
+    let opcode_count = count_non_push_opcodes(script)?;
+    if opcode_count > MAX_NON_PUSH_OPCODES {
+        return Err(ScriptError::OpcodeExceeded {
+            limit: MAX_NON_PUSH_OPCODES,
+            actual: opcode_count,
+        });
+    }
+    Ok(())
 }
