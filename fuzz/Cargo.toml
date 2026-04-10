@@ -17,6 +17,8 @@ tx = { path = "../crates/tx" }
 puzzle = { path = "../crates/puzzle" }
 ecdsa-recovery = { path = "../crates/ecdsa-recovery" }
 arbitrary = { version = "1", features = ["derive"] }
+bitcoin = "0.32"
+secp256k1 = "0.31"
 
 [workspace]
 members = ["."]
@@ -44,4 +46,19 @@ doc = false
 [[bin]]
 name = "fuzz_puzzle"
 path = "fuzz_targets/puzzle.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sighash_crosscheck"
+path = "fuzz_targets/sighash_crosscheck.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_push_number"
+path = "fuzz_targets/push_number.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_scalar"
+path = "fuzz_targets/scalar.rs"
 doc = false
