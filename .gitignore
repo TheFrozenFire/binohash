@@ -1,3 +1,6 @@
 /target
 /ref
 *.pdf
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
