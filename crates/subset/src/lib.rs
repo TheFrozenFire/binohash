@@ -69,6 +69,63 @@ pub fn next_combination(current: &[usize], n: usize) -> Option<Vec<usize>> {
     None
 }
 
+/// Compute the nth combination in lexicographic order using the combinatorial
+/// number system.
+///
+/// Given an index in [0, C(n,k)), returns the corresponding k-element subset.
+/// Returns `None` if the index is out of range or k > n.
+///
+/// This enables O(k) random access into the combination space — critical for
+/// parallel partitioning of the C(150,9) search space across workers.
+pub fn nth_combination(n: usize, k: usize, mut index: u128) -> Option<Vec<usize>> {
+    if k == 0 {
+        return if index == 0 { Some(Vec::new()) } else { None };
+    }
+    if k > n || index >= binomial_coefficient(n, k) {
+        return None;
+    }
+
+    let mut result = Vec::with_capacity(k);
+    let mut start = 0usize;
+    let mut remaining_k = k;
+
+    for _ in 0..k {
+        // Find the smallest element `c` in [start, n - remaining_k] such that
+        // C(n - 1 - c, remaining_k - 1) <= index
+        for c in start..n {
+            let count = binomial_coefficient(n - 1 - c, remaining_k - 1);
+            if index < count {
+                result.push(c);
+                start = c + 1;
+                remaining_k -= 1;
+                break;
+            }
+            index -= count;
+        }
+    }
+
+    Some(result)
+}
+
+/// Compute the lexicographic index of a combination (inverse of `nth_combination`).
+///
+/// Returns the index in [0, C(n,k)) for the given combination.
+pub fn combination_index(combo: &[usize], n: usize) -> u128 {
+    let k = combo.len();
+    let mut index: u128 = 0;
+    let mut start = 0usize;
+
+    for (i, &c) in combo.iter().enumerate() {
+        let remaining_k = k - i;
+        for j in start..c {
+            index += binomial_coefficient(n - 1 - j, remaining_k - 1);
+        }
+        start = c + 1;
+    }
+
+    index
+}
+
 /// Compute the binomial coefficient C(n, k) = n! / (k! * (n-k)!).
 ///
 /// Returns 0 when k > n. Uses u128 to handle large values like C(150, 9).

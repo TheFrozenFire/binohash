@@ -1,4 +1,7 @@
-use subset::{CombinationIter, binomial_coefficient, first_combination, next_combination};
+use subset::{
+    CombinationIter, binomial_coefficient, combination_index, first_combination, next_combination,
+    nth_combination,
+};
 
 #[test]
 fn c_5_3_produces_10_subsets_in_lex_order() {
@@ -121,4 +124,64 @@ fn subsets_are_in_strictly_increasing_lex_order() {
             window[1]
         );
     }
+}
+
+#[test]
+fn nth_combination_matches_iterator() {
+    let all: Vec<Vec<usize>> = CombinationIter::new(6, 3).collect();
+    for (i, expected) in all.iter().enumerate() {
+        let actual = nth_combination(6, 3, i as u128).expect("should produce a combination");
+        assert_eq!(&actual, expected, "nth_combination(6, 3, {i})");
+    }
+}
+
+#[test]
+fn nth_combination_out_of_range() {
+    assert!(nth_combination(5, 3, 10).is_none()); // C(5,3)=10, index 10 is out of range
+    assert!(nth_combination(5, 3, 100).is_none());
+    assert!(nth_combination(3, 5, 0).is_none()); // k > n
+}
+
+#[test]
+fn nth_combination_edge_cases() {
+    assert_eq!(nth_combination(5, 0, 0), Some(vec![]));
+    assert!(nth_combination(5, 0, 1).is_none());
+    assert_eq!(nth_combination(4, 4, 0), Some(vec![0, 1, 2, 3]));
+    assert!(nth_combination(4, 4, 1).is_none());
+}
+
+#[test]
+fn nth_combination_first_and_last() {
+    // First: [0, 1, 2]
+    assert_eq!(nth_combination(5, 3, 0), Some(vec![0, 1, 2]));
+    // Last: [2, 3, 4]
+    assert_eq!(nth_combination(5, 3, 9), Some(vec![2, 3, 4]));
+}
+
+#[test]
+fn combination_index_roundtrip() {
+    let all: Vec<Vec<usize>> = CombinationIter::new(7, 3).collect();
+    for (i, combo) in all.iter().enumerate() {
+        let idx = combination_index(combo, 7);
+        assert_eq!(idx, i as u128, "combination_index({combo:?}, 7)");
+        let back = nth_combination(7, 3, idx).unwrap();
+        assert_eq!(&back, combo, "roundtrip at index {i}");
+    }
+}
+
+#[test]
+fn combination_index_large() {
+    // Last combination of C(150, 9) has index C(150,9) - 1
+    let last = vec![141, 142, 143, 144, 145, 146, 147, 148, 149];
+    let total = binomial_coefficient(150, 9);
+    assert_eq!(combination_index(&last, 150), total - 1);
+    assert_eq!(nth_combination(150, 9, total - 1), Some(last));
+}
+
+#[test]
+fn nth_combination_first_of_large() {
+    assert_eq!(
+        nth_combination(150, 9, 0),
+        Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8])
+    );
 }

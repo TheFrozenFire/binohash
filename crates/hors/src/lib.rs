@@ -65,6 +65,7 @@ pub struct NonceSig {
     pub r: [u8; 32],
     pub s: [u8; 32],
     pub der_encoded: Vec<u8>,
+    parsed: der::ParsedDerSig,
 }
 
 impl NonceSig {
@@ -76,11 +77,16 @@ impl NonceSig {
         let r = derive_valid_xcoord(&format!("{label}_r"));
         let s = derive_valid_scalar(&format!("{label}_s"));
         let der_encoded = der::encode_der_sig(&r, &s, 0x01);
-        Self { r, s, der_encoded }
+        let parsed = der::ParsedDerSig {
+            r,
+            s,
+            sighash_type: 0x01,
+        };
+        Self { r, s, der_encoded, parsed }
     }
 
-    /// Parse the DER-encoded signature into a `ParsedDerSig`.
-    pub fn parsed(&self) -> der::ParsedDerSig {
-        der::parse_der_sig(&self.der_encoded).expect("nonce sig should always be valid DER")
+    /// Get the parsed DER signature.
+    pub fn parsed(&self) -> &der::ParsedDerSig {
+        &self.parsed
     }
 }

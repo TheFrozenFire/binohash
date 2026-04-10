@@ -3,7 +3,7 @@ use ecdsa_recovery::PublicKey;
 use puzzle::{PuzzleHit, SearchMode, evaluate_puzzle};
 use rayon::prelude::*;
 use script::{find_and_delete, push_data, push_number};
-use subset::{CombinationIter, first_combination, next_combination};
+use subset::CombinationIter;
 use tx::Transaction;
 
 /// Parameters for the pinning puzzle search.
@@ -435,6 +435,9 @@ pub struct DigestSearchResult {
 }
 
 /// Search for a digest solution with a budget and resumable progress.
+///
+/// Uses `nth_combination` for index-based parallel evaluation within chunks.
+/// Progress is tracked by combination index for exact resumption.
 pub fn search_digest_chunked(
     params: &DigestSearchParams<'_>,
     progress: DigestProgress,
@@ -448,72 +451,80 @@ pub fn search_digest_chunked(
     }
 
     let t_total = params.t_signed + params.t_bonus;
+    let total = subset::binomial_coefficient(params.n, t_total);
     let base_script_code = find_and_delete(params.full_script, params.sig_nonce_bytes);
 
-    let initial = progress
-        .next_combo
-        .or_else(|| first_combination(params.n, t_total));
+    // Compute the starting index from progress
+    let start_index = match &progress.next_combo {
+        Some(combo) => subset::combination_index(combo, params.n),
+        None => 0,
+    };
 
-    let mut current = initial;
-    let mut checked = 0u64;
-
-    while checked < budget {
-        let combo = match current.take() {
-            Some(c) => c,
-            None => break,
+    if start_index >= total {
+        return DigestSearchResult {
+            hit: None,
+            progress: DigestProgress {
+                next_combo: None,
+                checked: progress.checked,
+                exhausted: true,
+            },
         };
-
-        // Evaluate this candidate
-        let mut script_code = base_script_code.clone();
-        for &index in &combo {
-            script_code = find_and_delete(&script_code, &params.dummy_sigs[index]);
-        }
-
-        let next = next_combination(&combo, params.n);
-        checked += 1;
-
-        if let Ok(digest) = params.tx.legacy_sighash(
-            params.input_index,
-            &script_code,
-            params.sig_nonce.sighash_type,
-        ) {
-            if let Some(hit) = evaluate_puzzle(params.sig_nonce, digest, params.mode) {
-                let key_puzzle = if hit.is_strict_der {
-                    recover_key_puzzle(&hit, params.tx, params.full_script, params.input_index)
-                } else {
-                    None
-                };
-
-                let signed_indices = combo[..params.t_signed].to_vec();
-                let bonus_indices = combo[params.t_signed..].to_vec();
-
-                let exhausted = next.is_none();
-                return DigestSearchResult {
-                    hit: Some(DigestHit {
-                        signed_indices,
-                        bonus_indices,
-                        indices: combo,
-                        puzzle_hit: hit,
-                        key_puzzle,
-                    }),
-                    progress: DigestProgress {
-                        next_combo: next,
-                        checked: progress.checked + checked,
-                        exhausted,
-                    },
-                };
-            }
-        }
-
-        current = next;
     }
 
-    let exhausted = current.is_none();
+    let end_index = (start_index + budget as u128).min(total);
+
+    let found = (start_index..end_index)
+        .into_par_iter()
+        .find_map_first(|idx| {
+            let combo = subset::nth_combination(params.n, t_total, idx)?;
+
+            let mut script_code = base_script_code.clone();
+            for &index in &combo {
+                script_code = find_and_delete(&script_code, &params.dummy_sigs[index]);
+            }
+
+            let digest = params
+                .tx
+                .legacy_sighash(
+                    params.input_index,
+                    &script_code,
+                    params.sig_nonce.sighash_type,
+                )
+                .ok()?;
+
+            let hit = evaluate_puzzle(params.sig_nonce, digest, params.mode)?;
+
+            let key_puzzle = if hit.is_strict_der {
+                recover_key_puzzle(&hit, params.tx, params.full_script, params.input_index)
+            } else {
+                None
+            };
+
+            let signed_indices = combo[..params.t_signed].to_vec();
+            let bonus_indices = combo[params.t_signed..].to_vec();
+
+            Some(DigestHit {
+                signed_indices,
+                bonus_indices,
+                indices: combo,
+                puzzle_hit: hit,
+                key_puzzle,
+            })
+        });
+
+    let checked = progress.checked + (end_index - start_index) as u64;
+    let exhausted = end_index >= total;
+    let next_combo = if exhausted {
+        None
+    } else {
+        subset::nth_combination(params.n, t_total, end_index)
+    };
+
     DigestSearchResult {
-        hit: None,
+        hit: found,
         progress: DigestProgress {
-            next_combo: current,
-            checked: progress.checked + checked,
+            next_combo,
+            checked,
             exhausted,
         },
     }

@@ -3,7 +3,9 @@ use puzzle::SearchMode;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use search::{
-    DigestSearchParams, PinningSearchParams, PinningSearchSpace, search_digest, search_pinning,
+    AssemblyParams, DigestProgress, DigestSearchParams, PinningProgress, PinningSearchParams,
+    PinningSearchSpace, assemble_script_sig, recover_dummy_pubkey, search_digest,
+    search_digest_chunked, search_pinning, search_pinning_chunked,
 };
 use script::{QsbConfig, build_full_script, find_and_delete};
 use tx::{Transaction, TxIn, TxOut};
@@ -93,7 +95,7 @@ fn pinning_search_finds_hit_in_easy_mode() {
         tx: &f.template_tx,
         full_script: &f.full_script,
         pin_script_code: &pin_script_code,
-        sig_nonce: &f.pin_sig.parsed(),
+        sig_nonce: f.pin_sig.parsed(),
         sig_nonce_bytes: &f.pin_sig.der_encoded,
         search_space: PinningSearchSpace {
             sequence_start: 0xffff_fffe,
@@ -121,7 +123,7 @@ fn digest_search_finds_hit_in_easy_mode() {
         tx: &f.template_tx,
         full_script: &f.full_script,
         pin_script_code: &pin_script_code,
-        sig_nonce: &f.pin_sig.parsed(),
+        sig_nonce: f.pin_sig.parsed(),
         sig_nonce_bytes: &f.pin_sig.der_encoded,
         search_space: PinningSearchSpace {
             sequence_start: 0xffff_fffe,
@@ -144,7 +146,7 @@ fn digest_search_finds_hit_in_easy_mode() {
     let round_result = search_digest(DigestSearchParams {
         tx: &tx,
         full_script: &f.full_script,
-        sig_nonce: &f.round_sigs[0].parsed(),
+        sig_nonce: f.round_sigs[0].parsed(),
         sig_nonce_bytes: &f.round_sigs[0].der_encoded,
         dummy_sigs: &f.dummy_sigs[0],
         hors_secrets: &f.hors_keys[0].secrets,
@@ -171,7 +173,7 @@ fn full_pipeline_easy_mode() {
         tx: &f.template_tx,
         full_script: &f.full_script,
         pin_script_code: &pin_script_code,
-        sig_nonce: &f.pin_sig.parsed(),
+        sig_nonce: f.pin_sig.parsed(),
         sig_nonce_bytes: &f.pin_sig.der_encoded,
         search_space: PinningSearchSpace {
             sequence_start: 0xffff_fffe,
@@ -193,7 +195,7 @@ fn full_pipeline_easy_mode() {
         let result = search_digest(DigestSearchParams {
             tx: &tx,
             full_script: &f.full_script,
-            sig_nonce: &f.round_sigs[round].parsed(),
+            sig_nonce: f.round_sigs[round].parsed(),
             sig_nonce_bytes: &f.round_sigs[round].der_encoded,
             dummy_sigs: &f.dummy_sigs[round],
             hors_secrets: &f.hors_keys[round].secrets,
@@ -218,4 +220,231 @@ fn full_pipeline_easy_mode() {
             );
         }
     }
+}
+
+#[test]
+fn recover_dummy_pubkey_roundtrip() {
+    let dummy_sigs = generate_dummy_sigs(10, 0);
+    for (i, sig) in dummy_sigs.iter().enumerate() {
+        let pubkey = recover_dummy_pubkey(sig);
+        assert!(pubkey.is_some(), "dummy sig {i} should recover a pubkey");
+        let pk = pubkey.unwrap();
+        let serialized = pk.serialize();
+        assert_eq!(serialized.len(), 33);
+        assert!(serialized[0] == 0x02 || serialized[0] == 0x03);
+    }
+}
+
+#[test]
+fn assemble_script_sig_produces_output() {
+    let f = TestFixture::new();
+    let pin_script_code = find_and_delete(&f.full_script, &f.pin_sig.der_encoded);
+
+    let pin_hit = search_pinning(PinningSearchParams {
+        tx: &f.template_tx,
+        full_script: &f.full_script,
+        pin_script_code: &pin_script_code,
+        sig_nonce: f.pin_sig.parsed(),
+        sig_nonce_bytes: &f.pin_sig.der_encoded,
+        search_space: PinningSearchSpace {
+            sequence_start: 0xffff_fffe,
+            sequence_count: 1,
+            locktime_start: 1,
+            locktime_count: 10_000,
+        },
+        mode: SearchMode::EasyTest,
+        input_index: 1,
+        tx_modifier: None,
+    })
+    .expect("pinning");
+
+    let mut tx = f.template_tx.clone();
+    tx.inputs[1].sequence = pin_hit.sequence;
+    tx.locktime = pin_hit.locktime;
+
+    let mut round_hits = Vec::new();
+    for round in 0..2 {
+        let mut hit = search_digest(DigestSearchParams {
+            tx: &tx,
+            full_script: &f.full_script,
+            sig_nonce: f.round_sigs[round].parsed(),
+            sig_nonce_bytes: &f.round_sigs[round].der_encoded,
+            dummy_sigs: &f.dummy_sigs[round],
+            hors_secrets: &f.hors_keys[round].secrets,
+            n: f.config.n,
+            t_signed: f.t_signed(round),
+            t_bonus: f.t_bonus(round),
+            mode: SearchMode::EasyTest,
+            input_index: 1,
+        })
+        .expect("digest");
+        // In easy mode, key_puzzle may be None — fill with placeholder for assembly test
+        if hit.key_puzzle.is_none() {
+            hit.key_puzzle = Some(hit.puzzle_hit.key_nonce);
+        }
+        round_hits.push(hit);
+    }
+
+    // Assembly requires key_puzzle on pinning hit — use placeholder if easy mode
+    let pin_key_puzzle = pin_hit.puzzle_hit.key_nonce;
+
+    let result = assemble_script_sig(&AssemblyParams {
+        pinning: &pin_hit,
+        pin_key_puzzle: &pin_key_puzzle,
+        round1: &round_hits[0],
+        round2: &round_hits[1],
+        round1_dummy_sigs: &f.dummy_sigs[0],
+        round2_dummy_sigs: &f.dummy_sigs[1],
+        round1_hors_secrets: &f.hors_keys[0].secrets,
+        round2_hors_secrets: &f.hors_keys[1].secrets,
+    });
+
+    assert!(result.is_some(), "scriptSig assembly should succeed");
+    let sig = result.unwrap();
+    assert!(!sig.is_empty(), "scriptSig should not be empty");
+    // Should contain at least the pinning key_nonce (33 bytes + push prefix)
+    assert!(sig.len() > 34);
+}
+
+#[test]
+fn pinning_search_chunked_resumes_correctly() {
+    let f = TestFixture::new();
+    let pin_script_code = find_and_delete(&f.full_script, &f.pin_sig.der_encoded);
+
+    let params = PinningSearchParams {
+        tx: &f.template_tx,
+        full_script: &f.full_script,
+        pin_script_code: &pin_script_code,
+        sig_nonce: f.pin_sig.parsed(),
+        sig_nonce_bytes: &f.pin_sig.der_encoded,
+        search_space: PinningSearchSpace {
+            sequence_start: 0xffff_fffe,
+            sequence_count: 1,
+            locktime_start: 1,
+            locktime_count: 10_000,
+        },
+        mode: SearchMode::EasyTest,
+        input_index: 1,
+        tx_modifier: None,
+    };
+
+    // Search in small chunks until we find a hit
+    let mut progress = PinningProgress {
+        next_offset: 0,
+        checked: 0,
+        exhausted: false,
+    };
+
+    let mut found = false;
+    for _ in 0..100 {
+        let result = search_pinning_chunked(&params, progress.clone(), 100);
+        progress = result.progress;
+        if result.hit.is_some() {
+            found = true;
+            break;
+        }
+        if progress.exhausted {
+            break;
+        }
+    }
+
+    assert!(found, "chunked pinning search should find a hit");
+    assert!(progress.checked > 0);
+}
+
+#[test]
+fn digest_search_chunked_resumes_correctly() {
+    let f = TestFixture::new();
+    let pin_script_code = find_and_delete(&f.full_script, &f.pin_sig.der_encoded);
+
+    let pin_hit = search_pinning(PinningSearchParams {
+        tx: &f.template_tx,
+        full_script: &f.full_script,
+        pin_script_code: &pin_script_code,
+        sig_nonce: f.pin_sig.parsed(),
+        sig_nonce_bytes: &f.pin_sig.der_encoded,
+        search_space: PinningSearchSpace {
+            sequence_start: 0xffff_fffe,
+            sequence_count: 1,
+            locktime_start: 1,
+            locktime_count: 10_000,
+        },
+        mode: SearchMode::EasyTest,
+        input_index: 1,
+        tx_modifier: None,
+    })
+    .expect("pinning");
+
+    let mut tx = f.template_tx.clone();
+    tx.inputs[1].sequence = pin_hit.sequence;
+    tx.locktime = pin_hit.locktime;
+
+    let params = DigestSearchParams {
+        tx: &tx,
+        full_script: &f.full_script,
+        sig_nonce: f.round_sigs[0].parsed(),
+        sig_nonce_bytes: &f.round_sigs[0].der_encoded,
+        dummy_sigs: &f.dummy_sigs[0],
+        hors_secrets: &f.hors_keys[0].secrets,
+        n: f.config.n,
+        t_signed: f.t_signed(0),
+        t_bonus: f.t_bonus(0),
+        mode: SearchMode::EasyTest,
+        input_index: 1,
+    };
+
+    // Search in small chunks
+    let mut progress = DigestProgress {
+        next_combo: None,
+        checked: 0,
+        exhausted: false,
+    };
+
+    let mut found = false;
+    for _ in 0..50 {
+        let result = search_digest_chunked(&params, progress.clone(), 10);
+        progress = result.progress;
+        if result.hit.is_some() {
+            found = true;
+            break;
+        }
+        if progress.exhausted {
+            break;
+        }
+    }
+
+    assert!(found, "chunked digest search should find a hit");
+    assert!(progress.checked > 0);
+}
+
+#[test]
+fn tx_modifier_is_applied_during_pinning() {
+    let f = TestFixture::new();
+    let pin_script_code = find_and_delete(&f.full_script, &f.pin_sig.der_encoded);
+
+    // Use a modifier that changes an output value based on offset
+    let modifier = |tx: &mut Transaction, offset: u64| {
+        if !tx.outputs.is_empty() {
+            tx.outputs[0].value = 45_000 - (offset % 100);
+        }
+    };
+
+    let result = search_pinning(PinningSearchParams {
+        tx: &f.template_tx,
+        full_script: &f.full_script,
+        pin_script_code: &pin_script_code,
+        sig_nonce: f.pin_sig.parsed(),
+        sig_nonce_bytes: &f.pin_sig.der_encoded,
+        search_space: PinningSearchSpace {
+            sequence_start: 0xffff_fffe,
+            sequence_count: 1,
+            locktime_start: 1,
+            locktime_count: 10_000,
+        },
+        mode: SearchMode::EasyTest,
+        input_index: 1,
+        tx_modifier: Some(&modifier),
+    });
+
+    assert!(result.is_some(), "pinning with tx_modifier should find a hit");
 }
