@@ -1,0 +1,47 @@
+[package]
+name = "binohash-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+der = { path = "../crates/der" }
+hash = { path = "../crates/hash" }
+script = { path = "../crates/script" }
+subset = { path = "../crates/subset" }
+tx = { path = "../crates/tx" }
+puzzle = { path = "../crates/puzzle" }
+ecdsa-recovery = { path = "../crates/ecdsa-recovery" }
+arbitrary = { version = "1", features = ["derive"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_der"
+path = "fuzz_targets/der.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_subset"
+path = "fuzz_targets/subset.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_script"
+path = "fuzz_targets/script.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tx"
+path = "fuzz_targets/tx.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_puzzle"
+path = "fuzz_targets/puzzle.rs"
+doc = false

@@ -1,0 +1,22 @@
+[package]
+name = "benches"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+der = { path = "../der" }
+hash = { path = "../hash" }
+ecdsa-recovery = { path = "../ecdsa-recovery" }
+puzzle = { path = "../puzzle" }
+subset = { path = "../subset" }
+script = { path = "../script" }
+tx = { path = "../tx" }
+hors = { path = "../hors" }
+search = { path = "../search" }
+rand = "0.9"
+rand_chacha = "0.9"
+
+[[bench]]
+name = "primitives"
+harness = false

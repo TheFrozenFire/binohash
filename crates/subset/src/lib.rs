@@ -128,7 +128,8 @@ pub fn combination_index(combo: &[usize], n: usize) -> u128 {
 
 /// Compute the binomial coefficient C(n, k) = n! / (k! * (n-k)!).
 ///
-/// Returns 0 when k > n. Uses u128 to handle large values like C(150, 9).
+/// Returns 0 when k > n. Uses checked u128 arithmetic, returning `u128::MAX`
+/// on overflow (which is safe — callers compare against this for out-of-range checks).
 pub fn binomial_coefficient(n: usize, k: usize) -> u128 {
     if k > n {
         return 0;
@@ -142,8 +143,10 @@ pub fn binomial_coefficient(n: usize, k: usize) -> u128 {
     for i in 0..k {
         // Multiply first, then divide. The product C(n,i) * (n-i) / (i+1) is
         // always exact because C(n, i+1) = C(n, i) * (n-i) / (i+1) is an integer.
-        result = result * (n - i) as u128;
-        result /= (i + 1) as u128;
+        result = match result.checked_mul((n - i) as u128) {
+            Some(v) => v / (i + 1) as u128,
+            None => return u128::MAX, // overflow — value is astronomically large
+        };
     }
     result
 }
