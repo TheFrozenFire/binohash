@@ -1,0 +1,24 @@
+[package]
+name = "metal-gpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+der = { path = "../der" }
+hash = { path = "../hash" }
+ecdsa-recovery = { path = "../ecdsa-recovery" }
+puzzle = { path = "../puzzle" }
+script = { path = "../script" }
+tx = { path = "../tx" }
+hors = { path = "../hors" }
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.31"
+objc = "0.2"
+block2 = "0.6"
+secp256k1 = { version = "0.31", features = ["recovery"] }
+
+[dev-dependencies]
+rand = "0.9"
+rand_chacha = "0.9"
