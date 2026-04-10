@@ -658,14 +658,18 @@ struct PinningParams {
 kernel void pinning_search(
     constant PinningParams& params      [[buffer(0)]],
     const device uchar* suffix          [[buffer(1)]],   // suffix template bytes
-    constant uint256& neg_r_inv         [[buffer(2)]],   // precomputed -r^{-1} mod N
-    constant AffinePoint& u2r           [[buffer(3)]],   // precomputed u2*R point
+    const device uchar* neg_r_inv_be    [[buffer(2)]],   // -r^{-1} mod N, 32 BE bytes
+    const device uchar* u2r_be          [[buffer(3)]],   // u2*R: 32 BE bytes x, 32 BE bytes y
     const device uchar* gtable_x        [[buffer(4)]],   // GTable X coordinates
     const device uchar* gtable_y        [[buffer(5)]],   // GTable Y coordinates
     device atomic_uint* hit_count       [[buffer(6)]],   // number of hits found
     device uint* hit_indices            [[buffer(7)]],   // indices of hits
     uint gid                            [[thread_position_in_grid]]
 ) {
+    // Convert BE byte buffers to uint256 (LE limbs)
+    uint256 neg_r_inv = uint256_from_be(neg_r_inv_be);
+    AffinePoint u2r = { uint256_from_be(u2r_be), uint256_from_be(u2r_be + 32) };
+
     uint lt = params.start_lt + gid;
 
     // Copy suffix, patch sequence and locktime
@@ -748,4 +752,109 @@ kernel void pinning_search(
             hit_indices[pos] = gid;
         }
     }
+}
+
+// ============================================================
+// Test kernels — verify GPU operations against CPU reference
+// ============================================================
+
+// Test SHA-256: hash 32 input bytes, write 32 output bytes
+kernel void test_sha256(
+    const device uchar* input     [[buffer(0)]],
+    device uchar* output          [[buffer(1)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uchar inp[32];
+    for (int i = 0; i < 32; i++) inp[i] = input[i];
+    sha256_32bytes(inp, output);
+}
+
+// Test HASH160: hash 33 input bytes, write 20 output bytes
+kernel void test_hash160(
+    const device uchar* input     [[buffer(0)]],
+    device uchar* output          [[buffer(1)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uchar inp[33];
+    for (int i = 0; i < 33; i++) inp[i] = input[i];
+    hash160_33bytes(inp, output);
+}
+
+// Test field multiplication: a * b mod P, all as 32 BE bytes
+kernel void test_field_mul(
+    const device uchar* a_be      [[buffer(0)]],
+    const device uchar* b_be      [[buffer(1)]],
+    device uchar* result_be       [[buffer(2)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uint256 a = uint256_from_be(a_be);
+    uint256 b = uint256_from_be(b_be);
+    uint256 r = field_mul(a, b);
+    uint256_to_be(r, result_be);
+}
+
+// Test field inversion: a^(-1) mod P, verify a * a^(-1) = 1
+kernel void test_field_inv(
+    const device uchar* a_be      [[buffer(0)]],
+    device uchar* inv_be          [[buffer(1)]],
+    device uchar* product_be      [[buffer(2)]],  // a * inv(a) — should be 1
+    uint gid                      [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uint256 a = uint256_from_be(a_be);
+    uint256 inv = field_inv(a);
+    uint256 product = field_mul(a, inv);
+    uint256_to_be(inv, inv_be);
+    uint256_to_be(product, product_be);
+}
+
+// Test EC scalar multiplication: scalar * G via GTable, output affine (x, y) as BE bytes
+kernel void test_ec_mul(
+    const device uchar* scalar_be [[buffer(0)]],
+    const device uchar* gtable_x  [[buffer(1)]],
+    const device uchar* gtable_y  [[buffer(2)]],
+    device uchar* out_x_be        [[buffer(3)]],
+    device uchar* out_y_be        [[buffer(4)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uint256 scalar = uint256_from_be(scalar_be);
+    JacobianPoint jp = ec_mul_gtable(scalar, gtable_x, gtable_y);
+    AffinePoint ap = jacobian_to_affine(jp);
+    uint256_to_be(ap.x, out_x_be);
+    uint256_to_be(ap.y, out_y_be);
+}
+
+// Test full EC recovery pipeline: given digest (32 BE bytes), neg_r_inv (32 BE),
+// u2r (64 BE: x||y), output compressed pubkey (33 bytes) + hash160 (20 bytes)
+kernel void test_ec_recovery(
+    const device uchar* digest_be   [[buffer(0)]],
+    const device uchar* neg_r_inv_be [[buffer(1)]],
+    const device uchar* u2r_be      [[buffer(2)]],
+    const device uchar* gtable_x    [[buffer(3)]],
+    const device uchar* gtable_y    [[buffer(4)]],
+    device uchar* out_pubkey        [[buffer(5)]],  // 33 bytes compressed
+    device uchar* out_hash160       [[buffer(6)]],  // 20 bytes
+    uint gid                        [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+
+    uint256 z = uint256_from_be(digest_be);
+    uint256 nri = uint256_from_be(neg_r_inv_be);
+    AffinePoint u2r = { uint256_from_be(u2r_be), uint256_from_be(u2r_be + 32) };
+
+    uint256 u1 = scalar_mul(nri, z);
+    JacobianPoint q = ec_mul_gtable(u1, gtable_x, gtable_y);
+    q = ec_add_mixed(q, u2r);
+    AffinePoint qa = jacobian_to_affine(q);
+
+    uchar compressed[33];
+    compressed[0] = (qa.y.d[0] & 1) ? 0x03 : 0x02;
+    uint256_to_be(qa.x, compressed + 1);
+    for (int i = 0; i < 33; i++) out_pubkey[i] = compressed[i];
+
+    hash160_33bytes(compressed, out_hash160);
 }
