@@ -1,0 +1,20 @@
+[package]
+name = "search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+der = { path = "../der" }
+hash = { path = "../hash" }
+ecdsa-recovery = { path = "../ecdsa-recovery" }
+puzzle = { path = "../puzzle" }
+subset = { path = "../subset" }
+script = { path = "../script" }
+tx = { path = "../tx" }
+hors = { path = "../hors" }
+rayon = "1"
+thiserror = "2"
+
+[dev-dependencies]
+rand = "0.9"
+rand_chacha = "0.9"

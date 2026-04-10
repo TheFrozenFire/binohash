@@ -1,0 +1,10 @@
+[package]
+name = "ecdsa-recovery"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+der = { path = "../der" }
+hash = { path = "../hash" }
+secp256k1 = { version = "0.31", features = ["recovery"] }
+thiserror = "2"

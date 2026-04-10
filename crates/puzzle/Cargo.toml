@@ -1,0 +1,10 @@
+[package]
+name = "puzzle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+der = { path = "../der" }
+hash = { path = "../hash" }
+ecdsa-recovery = { path = "../ecdsa-recovery" }
+thiserror = "2"

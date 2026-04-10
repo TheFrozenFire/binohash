@@ -1,0 +1,12 @@
+[package]
+name = "tx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hash = { path = "../hash" }
+script = { path = "../script" }
+thiserror = "2"
+
+[dev-dependencies]
+bitcoin = "0.32"
