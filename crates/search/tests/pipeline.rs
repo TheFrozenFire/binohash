@@ -103,6 +103,7 @@ fn pinning_search_finds_hit_in_easy_mode() {
         },
         mode: SearchMode::EasyTest,
         input_index: 1,
+        tx_modifier: None,
     });
 
     assert!(result.is_some(), "should find a pinning hit in easy mode");
@@ -130,6 +131,7 @@ fn digest_search_finds_hit_in_easy_mode() {
         },
         mode: SearchMode::EasyTest,
         input_index: 1,
+        tx_modifier: None,
     })
     .expect("pinning should succeed in easy mode");
 
@@ -179,6 +181,7 @@ fn full_pipeline_easy_mode() {
         },
         mode: SearchMode::EasyTest,
         input_index: 1,
+        tx_modifier: None,
     })
     .expect("pinning should succeed");
 
