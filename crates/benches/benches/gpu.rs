@@ -141,6 +141,13 @@ fn bench_field_throughput(c: &mut Criterion) {
                  threads as u64 * iters as u64 / 1_000_000),
         |b| b.iter(|| m.bench_field_op("bench_monty_sqr", threads, iters)),
     );
+
+    // Reference msl-secp256k1 mont_mul_optimised (verbatim algorithm, p from buffer)
+    c.bench_function(
+        &format!("GPU ref_mont_mul throughput ({threads}t × {iters}i = {}M muls)",
+                 threads as u64 * iters as u64 / 1_000_000),
+        |b| b.iter(|| m.bench_field_op("bench_ref_mont_mul", threads, iters)),
+    );
 }
 
 criterion_group!(

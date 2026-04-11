@@ -12,6 +12,7 @@ const SHADER_SOURCE: &str = concat!(
     include_str!("../shaders/der.metal"),
     include_str!("../shaders/kernels.metal"),
     include_str!("../shaders/montgomery.metal"),
+    include_str!("../shaders/mont_benchmark_comparison.metal"),
 );
 const MAX_HITS: usize = 1024;
 const THREADS_PER_GROUP: u64 = 256;
