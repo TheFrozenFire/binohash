@@ -183,6 +183,88 @@ fn bench_ec_comparison(c: &mut Criterion) {
     }
 }
 
+fn bench_batch_inversion(c: &mut Criterion) {
+    let m = &*MINER;
+
+    // Per-thread inversion: each of 65536 threads does 1 field_inv
+    let per_thread = m.make_pipeline("bench_inv_per_thread");
+    c.bench_function("GPU inv per-thread (65536t x 1i)", |b| {
+        b.iter(|| m.run_pipeline(&per_thread, 65536, 1))
+    });
+
+    // Batch inversion v1 (sequential): 65536 threads in groups of 256
+    let batch = m.make_pipeline("bench_inv_batch");
+
+    // Batch inversion v2 (parallel tree): all threads participate
+    let batch_tree = m.make_pipeline("bench_inv_batch_tree");
+
+    // Need custom dispatch with explicit threadgroup size = 256
+    c.bench_function("GPU inv batch (65536t x 1i, tg=256)", |b| {
+        b.iter(|| {
+            let seed: [u8; 32] = [0x42; 32];
+            let seed_buf = m.device().new_buffer_with_data(
+                seed.as_ptr() as *const _, 32,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = m.device().new_buffer(
+                32, metal::MTLResourceOptions::StorageModeShared,
+            );
+            let iters: u32 = 1;
+            let iter_buf = m.device().new_buffer_with_data(
+                &iters as *const u32 as *const _, 4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = m.queue().new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&batch);
+            enc.set_buffer(0, Some(&seed_buf), 0);
+            enc.set_buffer(1, Some(&out_buf), 0);
+            enc.set_buffer(2, Some(&iter_buf), 0);
+            // Explicit threadgroup size = 256 to match BATCH_SIZE
+            enc.dispatch_threads(
+                metal::MTLSize::new(65536, 1, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        })
+    });
+
+    c.bench_function("GPU inv batch-tree (65536t x 1i, tg=256)", |b| {
+        b.iter(|| {
+            let seed: [u8; 32] = [0x42; 32];
+            let seed_buf = m.device().new_buffer_with_data(
+                seed.as_ptr() as *const _, 32,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = m.device().new_buffer(
+                32, metal::MTLResourceOptions::StorageModeShared,
+            );
+            let iters: u32 = 1;
+            let iter_buf = m.device().new_buffer_with_data(
+                &iters as *const u32 as *const _, 4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = m.queue().new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&batch_tree);
+            enc.set_buffer(0, Some(&seed_buf), 0);
+            enc.set_buffer(1, Some(&out_buf), 0);
+            enc.set_buffer(2, Some(&iter_buf), 0);
+            enc.dispatch_threads(
+                metal::MTLSize::new(65536, 1, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_gpu_sha256,
@@ -193,5 +275,6 @@ criterion_group!(
     bench_cpu_puzzle_comparison,
     bench_field_throughput,
     bench_ec_comparison,
+    bench_batch_inversion,
 );
 criterion_main!(benches);

@@ -15,6 +15,7 @@ tx = { path = "../tx" }
 hors = { path = "../hors" }
 search = { path = "../search" }
 metal-gpu = { path = "../metal-gpu" }
+metal = "0.31"
 rand = "0.9"
 rand_chacha = "0.9"
 

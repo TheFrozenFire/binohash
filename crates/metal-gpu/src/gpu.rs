@@ -14,6 +14,7 @@ const SHADER_SOURCE: &str = concat!(
     include_str!("../shaders/montgomery.metal"),
     include_str!("../shaders/mont_benchmark_comparison.metal"),
     include_str!("../shaders/ec_comparison.metal"),
+    include_str!("../shaders/batch_inv.metal"),
 );
 const MAX_HITS: usize = 1024;
 const THREADS_PER_GROUP: u64 = 256;
@@ -339,6 +340,16 @@ impl MetalMiner {
         }
 
         hits
+    }
+
+    /// Get the Metal device.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Get the command queue.
+    pub fn queue(&self) -> &CommandQueue {
+        &self.queue
     }
 
     /// Get the device name.
