@@ -102,6 +102,33 @@ fn bench_cpu_puzzle_comparison(c: &mut Criterion) {
     });
 }
 
+fn bench_field_throughput(c: &mut Criterion) {
+    let m = &*MINER;
+    let threads = 262144u32;
+    let iters = 100u32;
+
+    // field_mul throughput: threads × iterations multiplications
+    c.bench_function(
+        &format!("GPU field_mul throughput ({threads}t × {iters}i = {}M muls)",
+                 threads as u64 * iters as u64 / 1_000_000),
+        |b| b.iter(|| m.bench_field_op("bench_field_mul", threads, iters)),
+    );
+
+    // field_sqr throughput (currently same as field_mul)
+    c.bench_function(
+        &format!("GPU field_sqr throughput ({threads}t × {iters}i = {}M sqrs)",
+                 threads as u64 * iters as u64 / 1_000_000),
+        |b| b.iter(|| m.bench_field_op("bench_field_sqr", threads, iters)),
+    );
+
+    // field_inv throughput: each inv = 271 field_muls
+    let inv_iters = 1u32;
+    c.bench_function(
+        &format!("GPU field_inv throughput ({threads}t × {inv_iters}i)"),
+        |b| b.iter(|| m.bench_field_op("bench_field_inv_loop", threads, inv_iters)),
+    );
+}
+
 criterion_group!(
     benches,
     bench_gpu_sha256,
@@ -110,5 +137,6 @@ criterion_group!(
     bench_gpu_ec_mul,
     bench_gpu_pinning_batch,
     bench_cpu_puzzle_comparison,
+    bench_field_throughput,
 );
 criterion_main!(benches);

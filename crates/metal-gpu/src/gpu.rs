@@ -337,6 +337,44 @@ impl MetalMiner {
         self.pinning_pipeline.max_total_threads_per_threadgroup()
     }
 
+    /// Benchmark kernel: run `iterations` of field_mul across `num_threads` GPU threads.
+    /// Returns wall-clock time. The result is chain-dependent to prevent dead-code elimination.
+    pub fn bench_field_op(&self, kernel_name: &str, num_threads: u32, iterations: u32) {
+        let library = self
+            .device
+            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
+            .expect("compile");
+        let function = library.get_function(kernel_name, None).expect("kernel fn");
+        let pipeline = self
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .expect("pipeline");
+
+        let seed: [u8; 32] = [0x42; 32];
+        let seed_buf = self.device.new_buffer_with_data(
+            seed.as_ptr() as *const _, 32, MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = self.device.new_buffer(32, MTLResourceOptions::StorageModeShared);
+        let iter_buf = self.device.new_buffer_with_data(
+            &iterations as *const u32 as *const _, 4, MTLResourceOptions::StorageModeShared,
+        );
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&seed_buf), 0);
+        enc.set_buffer(1, Some(&out_buf), 0);
+        enc.set_buffer(2, Some(&iter_buf), 0);
+        let tg = THREADS_PER_GROUP.min(pipeline.max_total_threads_per_threadgroup());
+        enc.dispatch_threads(
+            MTLSize::new(num_threads as u64, 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
     // ============================================================
     // Test helpers — dispatch individual GPU operations for correctness verification
     // ============================================================

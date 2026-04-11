@@ -688,3 +688,60 @@ kernel void test_ec_recovery(
     uchar h160[20]; hash160_33bytes(compressed, h160);
     for (int i=0;i<20;i++) out_hash160[i]=h160[i];
 }
+
+// ============================================================
+// Benchmark kernels — tight loops to measure field operation throughput
+// ============================================================
+
+// Run N iterations of field_mul, chain-dependent to prevent optimization.
+// Each thread starts from a different value (based on gid) for realistic divergence.
+kernel void bench_field_mul(
+    const device uchar* seed_be   [[buffer(0)]],
+    device uchar* out_be          [[buffer(1)]],
+    constant uint& iterations     [[buffer(2)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    uint256 a = uint256_from_be_device(seed_be);
+    // Mix in gid to give each thread a unique starting point
+    a.d[0] ^= gid;
+    uint256 b = field_add(a, uint256_one());
+
+    for (uint i = 0; i < iterations; i++) {
+        a = field_mul(a, b);
+    }
+    // Write result to prevent dead-code elimination
+    if (gid == 0) uint256_to_be_device(a, out_be);
+}
+
+// Run N iterations of field_sqr (currently calls field_mul(a,a)).
+kernel void bench_field_sqr(
+    const device uchar* seed_be   [[buffer(0)]],
+    device uchar* out_be          [[buffer(1)]],
+    constant uint& iterations     [[buffer(2)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    uint256 a = uint256_from_be_device(seed_be);
+    a.d[0] ^= gid;
+
+    for (uint i = 0; i < iterations; i++) {
+        a = field_sqr(a);
+    }
+    if (gid == 0) uint256_to_be_device(a, out_be);
+}
+
+// Run N iterations of field_inv (the big one — each inv does 271 field_muls).
+kernel void bench_field_inv_loop(
+    const device uchar* seed_be   [[buffer(0)]],
+    device uchar* out_be          [[buffer(1)]],
+    constant uint& iterations     [[buffer(2)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    uint256 a = uint256_from_be_device(seed_be);
+    a.d[0] ^= gid;
+    if (uint256_is_zero(a)) a = uint256_one(); // avoid inverting zero
+
+    for (uint i = 0; i < iterations; i++) {
+        a = field_inv(a);
+    }
+    if (gid == 0) uint256_to_be_device(a, out_be);
+}
