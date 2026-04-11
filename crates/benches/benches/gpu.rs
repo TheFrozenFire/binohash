@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use metal_gpu::MetalMiner;
+use metal_gpu::{GpuSearchParams, MetalMiner};
 use std::sync::LazyLock;
 
 static MINER: LazyLock<MetalMiner> = LazyLock::new(|| {
@@ -7,6 +7,56 @@ static MINER: LazyLock<MetalMiner> = LazyLock::new(|| {
     std::fs::create_dir_all(cache.parent().unwrap()).ok();
     MetalMiner::new(Some(&cache)).expect("Metal device")
 });
+
+/// Build real GPU search params for benchmarking.
+fn bench_gpu_search_params() -> GpuSearchParams {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let config = script::QsbConfig::test();
+    let pin_nonce = hors::NonceSig::derive("bench_real_pin");
+    let round1_nonce = hors::NonceSig::derive("bench_real_r1");
+    let round2_nonce = hors::NonceSig::derive("bench_real_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(99);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments, hors2.commitments],
+        &[dummy1, dummy2],
+    );
+
+    let mut tx = tx::Transaction::new(2, 0);
+    tx.add_input(tx::TxIn {
+        txid: [0xBB; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 50_000,
+        script_pubkey: vec![
+            0x76, 0xa9, 0x14,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x88, 0xac,
+        ],
+    });
+
+    GpuSearchParams::from_pinning_search(
+        pin_nonce.parsed(),
+        &tx,
+        &full_script,
+        &pin_nonce.der_encoded,
+        0,
+    )
+}
 
 fn bench_gpu_sha256(c: &mut Criterion) {
     let m = &*MINER;
@@ -45,55 +95,48 @@ fn bench_gpu_ec_mul(c: &mut Criterion) {
 
 fn bench_gpu_pinning_batch(c: &mut Criterion) {
     let m = &*MINER;
-
-    // Set up a realistic pinning search scenario
-    let nonce = hors::NonceSig::derive("bench_pin");
-    let parsed = nonce.parsed();
-
-    // Precompute neg_r_inv and u2r on CPU (these are constants per nonce sig)
-    // For the benchmark we just need plausible values — the kernel will run
-    // regardless of whether a DER hit is found.
-    let neg_r_inv = parsed.r; // Not mathematically correct, but valid bytes for benchmarking
-    let u2r_x = parsed.r;
-    let u2r_y = parsed.s;
-
-    // Minimal suffix (just enough for the kernel to run)
-    let suffix = vec![0u8; 32];
-    let midstate = [0u32; 8]; // dummy midstate
+    let params = bench_gpu_search_params();
 
     for batch_size in [1024u32, 65536, 262144] {
-        c.bench_function(&format!("GPU pinning batch ({batch_size} candidates)"), |b| {
+        c.bench_function(&format!("GPU pinning real ({batch_size} candidates)"), |b| {
             b.iter(|| {
                 m.search_pinning_batch(
-                    black_box(&midstate),
-                    black_box(&suffix),
-                    5000, // total_preimage_len
-                    4,    // seq_offset
-                    8,    // lt_offset
+                    black_box(&params.midstate),
+                    black_box(&params.suffix),
+                    params.total_preimage_len,
+                    params.seq_offset,
+                    params.lt_offset,
                     0xFFFFFFFE,
-                    1,    // start_lt
+                    1,
                     batch_size,
-                    black_box(&neg_r_inv),
-                    black_box(&u2r_x),
-                    black_box(&u2r_y),
-                    true, // easy_mode
+                    black_box(&params.neg_r_inv),
+                    black_box(&params.u2r_x),
+                    black_box(&params.u2r_y),
+                    true,
                 )
             })
         });
     }
 
-    // Batch inversion pinning kernel (262144 candidates, tg=256)
+    // Batch kernel (cooperative batch inversion) with real params
     let batch_pipeline = m.make_pipeline("pinning_search_batch");
-    c.bench_function("GPU pinning batch-inv (262144 candidates)", |b| {
+    c.bench_function("GPU pinning real batch-inv (262144 candidates)", |b| {
         b.iter(|| {
-            // Reuse the same buffer setup as search_pinning_batch
             m.search_pinning_batch_raw(
                 &batch_pipeline,
-                &midstate,
-                &suffix,
-                5000, 4, 8, 0xFFFFFFFE, 1, 262144,
-                &neg_r_inv, &u2r_x, &u2r_y, true,
-                256, // explicit threadgroup size
+                &params.midstate,
+                &params.suffix,
+                params.total_preimage_len,
+                params.seq_offset,
+                params.lt_offset,
+                0xFFFFFFFE,
+                1,
+                262144,
+                &params.neg_r_inv,
+                &params.u2r_x,
+                &params.u2r_y,
+                true,
+                256,
             )
         })
     });
