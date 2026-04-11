@@ -166,6 +166,22 @@ fn bench_field_throughput(c: &mut Criterion) {
     );
 }
 
+fn bench_hash_throughput(c: &mut Criterion) {
+    let m = &*MINER;
+    let threads = 262144u32;
+    let iters = 100u32;
+
+    c.bench_function(
+        &format!("GPU hash160 throughput ({threads}t x {iters}i)"),
+        |b| b.iter(|| m.bench_field_op("bench_hash160", threads, iters)),
+    );
+
+    c.bench_function(
+        &format!("GPU ripemd160 throughput ({threads}t x {iters}i)"),
+        |b| b.iter(|| m.bench_field_op("bench_ripemd160", threads, iters)),
+    );
+}
+
 fn bench_ec_comparison(c: &mut Criterion) {
     let m = &*MINER;
     let iters = 16u32;
@@ -290,6 +306,7 @@ criterion_group!(
     bench_gpu_pinning_batch,
     bench_cpu_puzzle_comparison,
     bench_field_throughput,
+    bench_hash_throughput,
     bench_ec_comparison,
     bench_batch_inversion,
 );

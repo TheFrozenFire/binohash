@@ -15,6 +15,7 @@ const SHADER_SOURCE: &str = concat!(
     include_str!("../shaders/mont_benchmark_comparison.metal"),
     include_str!("../shaders/ec_comparison.metal"),
     include_str!("../shaders/batch_inv.metal"),
+    include_str!("../shaders/hash_bench.metal"),
 );
 const MAX_HITS: usize = 1024;
 const THREADS_PER_GROUP: u64 = 256;
