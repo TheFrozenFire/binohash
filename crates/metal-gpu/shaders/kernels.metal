@@ -280,6 +280,19 @@ kernel void test_ec_recovery(
     for (int i=0;i<20;i++) out_hash160[i]=h160[i];
 }
 
+kernel void test_scalar_mul(
+    const device uchar* a_be    [[buffer(0)]],
+    const device uchar* b_be    [[buffer(1)]],
+    device uchar* result_be     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uint256 a = uint256_from_be_device(a_be);
+    uint256 b = uint256_from_be_device(b_be);
+    uint256 r = scalar_mul(a, b);
+    uint256_to_be_device(r, result_be);
+}
+
 // ============================================================
 // Benchmark kernels — tight loops to measure field operation throughput
 // ============================================================

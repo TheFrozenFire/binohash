@@ -12,11 +12,14 @@ uint256 scalar_mul(uint256 a, uint256 b) {
     mul256_full(a, b, prod);
     uint256 N = secp256k1_n();
 
-    const uint correction[5] = {0x2FC9BEBF, 0x402DA173, 0x50B75FC4, 0x14551231, 0x1};
+    // 2^256 mod N = 0x14551231950B75FC4402DA1732FC9BEBF
+    // In 32-bit LE limbs: {0x2FC9BEBF, 0x402DA173, 0x50B75FC4, 0x45512319, 0x1}
+    const uint correction[5] = {0x2FC9BEBF, 0x402DA173, 0x50B75FC4, 0x45512319, 0x1};
     uint256 r;
     for (int i = 0; i < 8; i++) r.d[i] = prod[i];
 
-    for (int pass = 0; pass < 2; pass++) {
+    // 3 passes needed: 8-limb high × 5-limb correction → 5-limb high → 2-limb → 0-limb
+    for (int pass = 0; pass < 3; pass++) {
         bool high_zero = true;
         for (int i = 8; i < 16; i++) { if (prod[i]) { high_zero = false; break; } }
         if (high_zero) break;

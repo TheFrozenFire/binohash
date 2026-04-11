@@ -1,4 +1,4 @@
-use metal_gpu::MetalMiner;
+use metal_gpu::{GpuSearchParams, MetalMiner};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -314,4 +314,160 @@ fn gpu_batch_pinning_matches_original() {
     );
     // Sanity: should have found some easy-mode hits in 1024 candidates (~64 expected)
     assert!(!orig_lts.is_empty(), "should find at least one easy-mode hit in 1024 candidates");
+}
+
+/// Build a minimal test transaction and QSB script for GPU parameter tests.
+fn build_test_tx_and_script() -> (tx::Transaction, Vec<u8>, hors::NonceSig) {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let config = script::QsbConfig::test();
+    let pin_nonce = hors::NonceSig::derive("gpu_params_test_pin");
+    let round1_nonce = hors::NonceSig::derive("gpu_params_test_r1");
+    let round2_nonce = hors::NonceSig::derive("gpu_params_test_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments, hors2.commitments],
+        &[dummy1, dummy2],
+    );
+
+    let mut tx = tx::Transaction::new(2, 0);
+    tx.add_input(tx::TxIn {
+        txid: [0xAA; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 50_000,
+        script_pubkey: vec![0x76, 0xa9, 0x14, /* 20 zero bytes */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0xac],
+    });
+
+    (tx, full_script, pin_nonce)
+}
+
+#[test]
+fn gpu_search_params_ec_recovery_matches_cpu() {
+    let m = miner();
+    let (tx, full_script, pin_nonce) = build_test_tx_and_script();
+
+    let params = GpuSearchParams::from_pinning_search(
+        pin_nonce.parsed(),
+        &tx,
+        &full_script,
+        &pin_nonce.der_encoded,
+        0,
+    );
+
+    // Verify r * neg_r_inv = -1 mod N (scalar inversion correctness)
+    {
+        use secp256k1::{Scalar, SecretKey};
+        let r_sk = SecretKey::from_byte_array(pin_nonce.parsed().r).expect("valid");
+        let neg_r_inv_scalar = Scalar::from_be_bytes(params.neg_r_inv).expect("valid");
+        let product = r_sk.mul_tweak(&neg_r_inv_scalar).expect("valid");
+        let mut n_minus_1 = ecdsa_recovery::SECP256K1_N;
+        n_minus_1[31] -= 1;
+        assert_eq!(
+            hex(&product.secret_bytes()), hex(&n_minus_1),
+            "r * neg_r_inv should equal N-1 (i.e., -1 mod N)"
+        );
+    }
+
+    // Verify GPU scalar_mul matches CPU for large values
+    let pin_script_code = script::find_and_delete(&full_script, &pin_nonce.der_encoded);
+    let test_locktime: u32 = 42;
+
+    let mut test_tx = tx.clone();
+    test_tx.inputs[0].sequence = 0xFFFFFFFE;
+    test_tx.locktime = test_locktime;
+    let cpu_digest = test_tx
+        .legacy_sighash(0, &pin_script_code, pin_nonce.parsed().sighash_type)
+        .expect("valid sighash");
+
+    {
+        use secp256k1::{Scalar, SecretKey};
+        let nri_sk = SecretKey::from_byte_array(params.neg_r_inv).expect("valid");
+        let z_scalar = Scalar::from_be_bytes(cpu_digest).expect("valid");
+        let cpu_u1 = nri_sk.mul_tweak(&z_scalar).expect("valid").secret_bytes();
+        let gpu_u1 = m.run_simple_kernel_2in_1out("test_scalar_mul", &params.neg_r_inv, &cpu_digest, 32);
+        assert_eq!(hex(&cpu_u1), hex(&gpu_u1), "GPU scalar_mul must match CPU");
+    }
+
+    // Run GPU EC recovery with the CPU-computed digest and precomputed params
+    let (gpu_pubkey, gpu_h160) = m.test_ec_recovery(
+        &cpu_digest,
+        &params.neg_r_inv,
+        &params.u2r_x,
+        &params.u2r_y,
+    );
+
+    // CPU recovery via secp256k1 library
+    let (cpu_key, _recid) = ecdsa_recovery::recover_first_pubkey(pin_nonce.parsed(), cpu_digest)
+        .expect("recovery should succeed");
+    let cpu_pubkey = cpu_key.serialize();
+    let cpu_h160 = hash::hash160(&cpu_pubkey);
+
+    assert_eq!(
+        hex(&gpu_pubkey), hex(&cpu_pubkey),
+        "GPU EC recovery pubkey must match CPU"
+    );
+    assert_eq!(
+        hex(&gpu_h160), hex(&cpu_h160),
+        "GPU HASH160 must match CPU"
+    );
+}
+
+#[test]
+fn gpu_search_params_midstate_produces_correct_sighash() {
+    let (tx, full_script, pin_nonce) = build_test_tx_and_script();
+
+    let params = GpuSearchParams::from_pinning_search(
+        pin_nonce.parsed(),
+        &tx,
+        &full_script,
+        &pin_nonce.der_encoded,
+        0,
+    );
+
+    let pin_script_code = script::find_and_delete(&full_script, &pin_nonce.der_encoded);
+    let test_locktime: u32 = 100;
+    let test_sequence: u32 = 0xFFFFFFFE;
+
+    let mut test_tx = tx.clone();
+    test_tx.inputs[0].sequence = test_sequence;
+    test_tx.locktime = test_locktime;
+    let preimage = test_tx
+        .legacy_sighash_preimage(0, &pin_script_code, pin_nonce.parsed().sighash_type)
+        .expect("valid preimage");
+
+    assert_eq!(preimage.len(), params.total_preimage_len as usize);
+    let midstate_boundary = preimage.len() - params.suffix.len();
+
+    // Verify sequence and locktime offsets point to the right bytes
+    let so = params.seq_offset as usize;
+    let lo = params.lt_offset as usize;
+    assert_eq!(
+        &preimage[midstate_boundary + so..midstate_boundary + so + 4],
+        &test_sequence.to_le_bytes(),
+        "sequence offset must be correct"
+    );
+    assert_eq!(
+        &preimage[midstate_boundary + lo..midstate_boundary + lo + 4],
+        &test_locktime.to_le_bytes(),
+        "locktime offset must be correct"
+    );
+
+    // Verify midstate matches sha256_midstate of the prefix
+    let recomputed_midstate = hash::sha256_midstate(&preimage[..midstate_boundary]);
+    assert_eq!(params.midstate, recomputed_midstate);
 }

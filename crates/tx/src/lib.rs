@@ -74,13 +74,6 @@ impl Transaction {
         script_code: &[u8],
         sighash_type: u8,
     ) -> Result<[u8; 32], TxError> {
-        if input_index >= self.inputs.len() {
-            return Err(TxError::InputOutOfBounds {
-                index: input_index,
-                count: self.inputs.len(),
-            });
-        }
-
         let base_type = sighash_type & 0x1f;
 
         // SIGHASH_SINGLE bug: if input_index >= outputs, return hash of 0x01
@@ -90,10 +83,35 @@ impl Transaction {
             return Ok(bug);
         }
 
+        let preimage = self.legacy_sighash_preimage(input_index, script_code, sighash_type)?;
+        Ok(hash::sha256d(&preimage))
+    }
+
+    /// Compute the raw sighash preimage (before double-SHA256).
+    ///
+    /// Returns the serialized transaction copy with the sighash type appended.
+    /// This is the data that gets double-SHA256'd to produce the sighash.
+    ///
+    /// Does NOT handle the SIGHASH_SINGLE bug case — returns an error if
+    /// `input_index >= outputs.len()` with SIGHASH_SINGLE.
+    pub fn legacy_sighash_preimage(
+        &self,
+        input_index: usize,
+        script_code: &[u8],
+        sighash_type: u8,
+    ) -> Result<Vec<u8>, TxError> {
+        if input_index >= self.inputs.len() {
+            return Err(TxError::InputOutOfBounds {
+                index: input_index,
+                count: self.inputs.len(),
+            });
+        }
+
+        let base_type = sighash_type & 0x1f;
+
         let mut tx_copy = Transaction::new(self.version, self.locktime);
 
         for (idx, input) in self.inputs.iter().enumerate() {
-            // ANYONECANPAY: only include the input being signed
             if sighash_type & SIGHASH_ANYONECANPAY != 0 && idx != input_index {
                 continue;
             }
@@ -109,7 +127,6 @@ impl Transaction {
                 sequence: input.sequence,
             };
 
-            // NONE and SINGLE: zero sequence for non-signing inputs
             if matches!(base_type, SIGHASH_NONE | SIGHASH_SINGLE) && idx != input_index {
                 copied.sequence = 0;
             }
@@ -118,7 +135,7 @@ impl Transaction {
         }
 
         match base_type {
-            SIGHASH_NONE => {} // no outputs
+            SIGHASH_NONE => {}
             SIGHASH_SINGLE => {
                 for output_index in 0..=input_index {
                     if output_index < input_index {
@@ -132,7 +149,6 @@ impl Transaction {
                 }
             }
             _ => {
-                // SIGHASH_ALL: include all outputs
                 for output in &self.outputs {
                     tx_copy.add_output(output.clone());
                 }
@@ -141,7 +157,7 @@ impl Transaction {
 
         let mut serialized = tx_copy.serialize();
         serialized.extend_from_slice(&(sighash_type as u32).to_le_bytes());
-        Ok(hash::sha256d(&serialized))
+        Ok(serialized)
     }
 }
 

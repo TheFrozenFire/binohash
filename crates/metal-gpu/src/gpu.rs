@@ -2,6 +2,195 @@ use metal::*;
 use std::mem;
 use std::path::Path;
 
+use der::ParsedDerSig;
+use ecdsa_recovery::SECP256K1_N;
+use script::find_and_delete;
+use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
+use tx::Transaction;
+
+// ============================================================
+// Scalar field arithmetic (mod N)
+// ============================================================
+
+/// Compute the modular inverse of a scalar: a^(-1) mod N.
+///
+/// Uses Fermat's little theorem: a^(-1) = a^(N-2) mod N, implemented via
+/// square-and-multiply using the secp256k1 crate's scalar operations.
+fn scalar_inv(a: &[u8; 32]) -> [u8; 32] {
+    // N - 2
+    let mut exp = SECP256K1_N;
+    let mut borrow: u16 = 2;
+    for i in (0..32).rev() {
+        let diff = exp[i] as u16 + 256 - borrow;
+        exp[i] = diff as u8;
+        borrow = if diff < 256 { 1 } else { 0 };
+    }
+
+    let a_scalar = Scalar::from_be_bytes(*a).expect("valid scalar");
+
+    // Square-and-multiply: a^(N-2) mod N
+    let mut result: Option<SecretKey> = None;
+    for byte in exp {
+        for bit in (0..8).rev() {
+            if let Some(ref mut r) = result {
+                // Square
+                let r_scalar = Scalar::from_be_bytes(r.secret_bytes()).expect("valid");
+                *r = r.mul_tweak(&r_scalar).expect("valid");
+                // Multiply if bit is set
+                if (byte >> bit) & 1 == 1 {
+                    *r = r.mul_tweak(&a_scalar).expect("valid");
+                }
+            } else if (byte >> bit) & 1 == 1 {
+                result = Some(SecretKey::from_byte_array(*a).expect("valid"));
+            }
+        }
+    }
+
+    result.expect("N-2 is nonzero").secret_bytes()
+}
+
+/// Negate a scalar: result = N - a (mod N).
+fn scalar_negate(a: &[u8; 32]) -> [u8; 32] {
+    SecretKey::from_byte_array(*a)
+        .expect("valid")
+        .negate()
+        .secret_bytes()
+}
+
+/// Multiply two scalars: result = a * b (mod N).
+fn scalar_mul_mod(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let sk = SecretKey::from_byte_array(*a).expect("valid");
+    let scalar = Scalar::from_be_bytes(*b).expect("valid");
+    sk.mul_tweak(&scalar).expect("valid").secret_bytes()
+}
+
+// ============================================================
+// GPU search parameters
+// ============================================================
+
+/// Precomputed parameters for GPU pinning search, derived from a real
+/// nonce signature and transaction template.
+#[derive(Debug, Clone)]
+pub struct GpuSearchParams {
+    /// SHA-256 state after processing the fixed prefix of the sighash preimage.
+    pub midstate: [u32; 8],
+    /// The variable suffix of the sighash preimage (starts at the midstate boundary).
+    pub suffix: Vec<u8>,
+    /// Total length of the full sighash preimage (prefix + suffix).
+    pub total_preimage_len: u32,
+    /// Offset of the sequence field within the suffix.
+    pub seq_offset: u32,
+    /// Offset of the locktime field within the suffix.
+    pub lt_offset: u32,
+    /// -r^(-1) mod N, as 32 big-endian bytes.
+    pub neg_r_inv: [u8; 32],
+    /// x-coordinate of u2*R, as 32 big-endian bytes.
+    pub u2r_x: [u8; 32],
+    /// y-coordinate of u2*R, as 32 big-endian bytes.
+    pub u2r_y: [u8; 32],
+}
+
+impl GpuSearchParams {
+    /// Build GPU search parameters from a pinning nonce signature, transaction
+    /// template, and script code.
+    ///
+    /// The `script_code` should already have FindAndDelete applied for the
+    /// nonce signature (this matches how the CPU search prepares it).
+    pub fn from_pinning_search(
+        sig_nonce: &ParsedDerSig,
+        tx: &Transaction,
+        full_script: &[u8],
+        sig_nonce_bytes: &[u8],
+        input_index: usize,
+    ) -> Self {
+        let secp = Secp256k1::new();
+
+        // ---- Scalar precomputations ----
+        // r_inv = r^(-1) mod N
+        let r_inv = scalar_inv(&sig_nonce.r);
+        // neg_r_inv = -r^(-1) mod N
+        let neg_r_inv = scalar_negate(&r_inv);
+        // u2 = s * r_inv mod N
+        let u2 = scalar_mul_mod(&sig_nonce.s, &r_inv);
+
+        // ---- EC point recovery ----
+        // R = curve point with x = r (even y, recovery_id = 0)
+        let mut r_compressed = [0u8; 33];
+        r_compressed[0] = 0x02;
+        r_compressed[1..].copy_from_slice(&sig_nonce.r);
+        let r_point = PublicKey::from_slice(&r_compressed).expect("r is a valid x-coordinate");
+
+        // u2r = u2 * R (EC scalar multiplication)
+        let u2_scalar = Scalar::from_be_bytes(u2).expect("valid scalar");
+        let u2r = r_point.mul_tweak(&secp, &u2_scalar).expect("valid tweak");
+        let u2r_uncompressed = u2r.serialize_uncompressed();
+        let mut u2r_x = [0u8; 32];
+        let mut u2r_y = [0u8; 32];
+        u2r_x.copy_from_slice(&u2r_uncompressed[1..33]);
+        u2r_y.copy_from_slice(&u2r_uncompressed[33..65]);
+
+        // ---- Sighash preimage decomposition ----
+        // Script code after FindAndDelete of the nonce sig
+        let pin_script_code = find_and_delete(full_script, sig_nonce_bytes);
+
+        // Find sequence and locktime offsets by diffing two preimages
+        let (seq_abs, lt_abs) = {
+            let mut tx1 = tx.clone();
+            tx1.inputs[input_index].sequence = 0xAAAAAAAA;
+            tx1.locktime = 0xBBBBBBBB;
+            let pre1 = tx1
+                .legacy_sighash_preimage(input_index, &pin_script_code, sig_nonce.sighash_type)
+                .expect("valid preimage");
+
+            let mut tx2 = tx.clone();
+            tx2.inputs[input_index].sequence = 0xCCCCCCCC;
+            tx2.locktime = 0xDDDDDDDD;
+            let pre2 = tx2
+                .legacy_sighash_preimage(input_index, &pin_script_code, sig_nonce.sighash_type)
+                .expect("valid preimage");
+
+            assert_eq!(pre1.len(), pre2.len(), "preimage lengths must be identical");
+
+            let mut seq_start = None;
+            let mut lt_start = None;
+            for i in 0..pre1.len() {
+                if pre1[i] != pre2[i] {
+                    if seq_start.is_none() {
+                        seq_start = Some(i);
+                    } else if lt_start.is_none() && i >= seq_start.unwrap() + 4 {
+                        lt_start = Some(i);
+                    }
+                }
+            }
+            (seq_start.expect("sequence field not found"), lt_start.expect("locktime field not found"))
+        };
+
+        // Split at the last 64-byte boundary before the sequence field
+        let midstate_boundary = (seq_abs / 64) * 64;
+
+        // Build the actual preimage to extract prefix and suffix
+        let preimage = tx
+            .legacy_sighash_preimage(input_index, &pin_script_code, sig_nonce.sighash_type)
+            .expect("valid preimage");
+
+        let prefix = &preimage[..midstate_boundary];
+        let suffix = preimage[midstate_boundary..].to_vec();
+
+        let midstate = hash::sha256_midstate(prefix);
+
+        GpuSearchParams {
+            midstate,
+            total_preimage_len: preimage.len() as u32,
+            seq_offset: (seq_abs - midstate_boundary) as u32,
+            lt_offset: (lt_abs - midstate_boundary) as u32,
+            suffix,
+            neg_r_inv,
+            u2r_x,
+            u2r_y,
+        }
+    }
+}
+
 const SHADER_SOURCE: &str = concat!(
     include_str!("../shaders/uint256.metal"),
     include_str!("../shaders/field.metal"),

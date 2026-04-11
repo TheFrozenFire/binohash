@@ -75,7 +75,10 @@ impl NonceSig {
     /// `derive_valid_scalar("{label}_s")` for s.
     pub fn derive(label: &str) -> Self {
         let r = derive_valid_xcoord(&format!("{label}_r"));
-        let s = derive_valid_scalar(&format!("{label}_s"));
+        let s_raw = derive_valid_scalar(&format!("{label}_s"));
+        // Enforce low-s (BIP 62): if s > N/2, use N - s.
+        // This ensures the nonce sig is valid for Bitcoin's CHECKSIG.
+        let s = Self::enforce_low_s(&s_raw);
         let der_encoded = der::encode_der_sig(&r, &s, 0x01);
         let parsed = der::ParsedDerSig {
             r,
@@ -83,6 +86,34 @@ impl NonceSig {
             sighash_type: 0x01,
         };
         Self { r, s, der_encoded, parsed }
+    }
+
+    /// If s > N/2, return N - s (low-s normalization per BIP 62).
+    fn enforce_low_s(s: &[u8; 32]) -> [u8; 32] {
+        // N/2 (rounded down) = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+        const N_HALF: [u8; 32] = [
+            0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
+            0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+        ];
+        if s.iter().zip(N_HALF.iter()).find_map(|(a, b)| match a.cmp(b) {
+            std::cmp::Ordering::Equal => None,
+            ord => Some(ord),
+        }).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Greater {
+            // s > N/2 → compute N - s
+            let n = ecdsa_recovery::SECP256K1_N;
+            let mut result = [0u8; 32];
+            let mut borrow: u16 = 0;
+            for i in (0..32).rev() {
+                let diff = n[i] as u16 + 256 - s[i] as u16 - borrow;
+                result[i] = diff as u8;
+                borrow = if diff < 256 { 1 } else { 0 };
+            }
+            result
+        } else {
+            *s
+        }
     }
 
     /// Get the parsed DER signature.

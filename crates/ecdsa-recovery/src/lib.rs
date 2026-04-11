@@ -48,8 +48,12 @@ pub fn recover_pubkey(
         .recover_ecdsa(msg, &rec_sig)
         .map_err(RecoveryError::RecoveryFailed)?;
 
-    // Verify the recovered key actually satisfies the signature
-    let std_sig: Signature = rec_sig.to_standard();
+    // Verify the recovered key actually satisfies the signature.
+    // Normalize s to low-s (BIP 62) before verification — secp256k1's verify
+    // enforces low-s, but recovery works with either. The x-coordinate check
+    // is symmetric (x(-R) = x(R)), so verification passes regardless.
+    let mut std_sig: Signature = rec_sig.to_standard();
+    std_sig.normalize_s();
     secp.verify_ecdsa(msg, &std_sig, &pubkey)
         .map_err(RecoveryError::VerificationFailed)?;
 
