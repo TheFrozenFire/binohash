@@ -14,9 +14,14 @@ script = { path = "../script" }
 tx = { path = "../tx" }
 hors = { path = "../hors" }
 search = { path = "../search" }
+metal-gpu = { path = "../metal-gpu" }
 rand = "0.9"
 rand_chacha = "0.9"
 
 [[bench]]
 name = "primitives"
+harness = false
+
+[[bench]]
+name = "gpu"
 harness = false

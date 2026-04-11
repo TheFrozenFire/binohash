@@ -60,6 +60,7 @@ dependencies = [
  "ecdsa-recovery",
  "hash",
  "hors",
+ "metal-gpu",
  "puzzle",
  "rand",
  "rand_chacha",
