@@ -142,6 +142,32 @@ fn bench_gpu_pinning_batch(c: &mut Criterion) {
     });
 }
 
+fn bench_gpu_pinning_batched(c: &mut Criterion) {
+    let m = &*MINER;
+    let params = bench_gpu_search_params();
+
+    for batch_size in [1024u32, 65536, 262144] {
+        c.bench_function(&format!("GPU pinning batched N=4 ({batch_size} candidates)"), |b| {
+            b.iter(|| {
+                m.search_pinning_batched(
+                    black_box(&params.midstate),
+                    black_box(&params.suffix),
+                    params.total_preimage_len,
+                    params.seq_offset,
+                    params.lt_offset,
+                    0xFFFFFFFE,
+                    1,
+                    batch_size,
+                    black_box(&params.neg_r_inv),
+                    black_box(&params.u2r_x),
+                    black_box(&params.u2r_y),
+                    true,
+                )
+            })
+        });
+    }
+}
+
 fn bench_cpu_puzzle_comparison(c: &mut Criterion) {
     // CPU baseline: evaluate_puzzle (the per-candidate bottleneck)
     let r = ecdsa_recovery::derive_valid_xcoord("bench_r");
@@ -347,6 +373,7 @@ criterion_group!(
     bench_gpu_field_inv,
     bench_gpu_ec_mul,
     bench_gpu_pinning_batch,
+    bench_gpu_pinning_batched,
     bench_cpu_puzzle_comparison,
     bench_field_throughput,
     bench_hash_throughput,

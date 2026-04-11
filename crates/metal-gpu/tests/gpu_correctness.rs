@@ -651,3 +651,68 @@ fn gpu_cpu_search_parity() {
         gpu_lts.len(), cpu_lts.len(), lt_count
     );
 }
+
+#[test]
+fn gpu_batched_kernel_matches_original() {
+    let m = miner();
+    let (tx, full_script, pin_nonce) = build_test_tx_and_script();
+
+    let params = GpuSearchParams::from_pinning_search(
+        pin_nonce.parsed(),
+        &tx,
+        &full_script,
+        &pin_nonce.der_encoded,
+        0,
+    );
+
+    let start_lt = 1_u32;
+    let batch_size = 8192_u32; // must be multiple of BATCH_N
+    let sequence = 0xFFFFFFFE_u32;
+
+    // Original kernel
+    let original_hits = m.search_pinning_batch(
+        &params.midstate,
+        &params.suffix,
+        params.total_preimage_len,
+        params.seq_offset,
+        params.lt_offset,
+        sequence,
+        start_lt,
+        batch_size,
+        &params.neg_r_inv,
+        &params.u2r_x,
+        &params.u2r_y,
+        true,
+    );
+
+    // Batched kernel (per-thread Montgomery inversion)
+    let batched_hits = m.search_pinning_batched(
+        &params.midstate,
+        &params.suffix,
+        params.total_preimage_len,
+        params.seq_offset,
+        params.lt_offset,
+        sequence,
+        start_lt,
+        batch_size,
+        &params.neg_r_inv,
+        &params.u2r_x,
+        &params.u2r_y,
+        true,
+    );
+
+    let mut orig_lts: Vec<u32> = original_hits.iter().map(|h| h.locktime).collect();
+    let mut batch_lts: Vec<u32> = batched_hits.iter().map(|h| h.locktime).collect();
+    orig_lts.sort();
+    batch_lts.sort();
+
+    assert_eq!(
+        orig_lts, batch_lts,
+        "Batched kernel must find identical hits.\nOriginal: {} hits\nBatched: {} hits",
+        orig_lts.len(), batch_lts.len()
+    );
+    println!(
+        "Batched kernel matches original: {}/{} hits over {} candidates",
+        batch_lts.len(), orig_lts.len(), batch_size
+    );
+}
