@@ -82,6 +82,140 @@ kernel void pinning_search(
 }
 
 // ============================================================
+// Batch pinning kernel — cooperative batch inversion
+//
+// Same pipeline as pinning_search, but threads cooperate at the
+// jacobian_to_affine step via parallel prefix batch inversion.
+// Requires threadgroup size = BATCH_INV_SIZE.
+// ============================================================
+
+#define BATCH_INV_SIZE 256
+
+kernel void pinning_search_batch(
+    constant PinningParams& params      [[buffer(0)]],
+    const device uchar* suffix          [[buffer(1)]],
+    const device uchar* neg_r_inv_be    [[buffer(2)]],
+    const device uchar* u2r_be          [[buffer(3)]],
+    const device uchar* gtable_x        [[buffer(4)]],
+    const device uchar* gtable_y        [[buffer(5)]],
+    device atomic_uint* hit_count       [[buffer(6)]],
+    device uint* hit_indices            [[buffer(7)]],
+    uint gid                            [[thread_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    // Shared memory for batch inversion
+    threadgroup uint256 inv_tree[BATCH_INV_SIZE];
+    threadgroup uint256 inv_origz[BATCH_INV_SIZE];
+
+    uint256 neg_r_inv = uint256_from_be_device(neg_r_inv_be);
+    AffinePoint u2r = {uint256_from_be_device(u2r_be), uint256_from_be_device(u2r_be+32)};
+    uint lt = params.start_lt + gid;
+
+    // ---- Phase 1: Independent per-thread work ----
+    // SHA-256d from midstate
+    uchar buf[128];
+    for (uint i = 0; i < params.suffix_len; i++) buf[i] = suffix[i];
+    buf[params.seq_offset]=(uchar)(params.seq_value);
+    buf[params.seq_offset+1]=(uchar)(params.seq_value>>8);
+    buf[params.seq_offset+2]=(uchar)(params.seq_value>>16);
+    buf[params.seq_offset+3]=(uchar)(params.seq_value>>24);
+    buf[params.lt_offset]=(uchar)(lt); buf[params.lt_offset+1]=(uchar)(lt>>8);
+    buf[params.lt_offset+2]=(uchar)(lt>>16); buf[params.lt_offset+3]=(uchar)(lt>>24);
+
+    buf[params.suffix_len]=0x80;
+    for (uint i=params.suffix_len+1;i<128;i++) buf[i]=0;
+    uint nblk=(params.suffix_len<56)?1:2;
+    ulong bit_len=(ulong)params.total_preimage_len*8;
+    uint last=nblk*64-8;
+    buf[last]=(uchar)(bit_len>>56);buf[last+1]=(uchar)(bit_len>>48);
+    buf[last+2]=(uchar)(bit_len>>40);buf[last+3]=(uchar)(bit_len>>32);
+    buf[last+4]=(uchar)(bit_len>>24);buf[last+5]=(uchar)(bit_len>>16);
+    buf[last+6]=(uchar)(bit_len>>8);buf[last+7]=(uchar)(bit_len);
+
+    uint state[8]; for (int i=0;i<8;i++) state[i]=params.midstate[i];
+    for (uint b=0;b<nblk;b++) {
+        uint W[64];
+        for (int i=0;i<16;i++)
+            W[i]=((uint)buf[b*64+i*4]<<24)|((uint)buf[b*64+i*4+1]<<16)|
+                 ((uint)buf[b*64+i*4+2]<<8)|(uint)buf[b*64+i*4+3];
+        sha256_compress(state,W);
+    }
+
+    uchar first_hash[32];
+    for (int i=0;i<8;i++){first_hash[i*4]=(uchar)(state[i]>>24);first_hash[i*4+1]=(uchar)(state[i]>>16);
+        first_hash[i*4+2]=(uchar)(state[i]>>8);first_hash[i*4+3]=(uchar)(state[i]);}
+    uchar sighash[32];
+    sha256_32bytes(first_hash,sighash);
+
+    // EC recovery
+    uint256 z = uint256_from_be_thread(sighash);
+    uint256 u1 = scalar_mul(neg_r_inv, z);
+    JacobianPoint q = ec_mul_gtable(u1, gtable_x, gtable_y);
+    q = ec_add_mixed(q, u2r);
+
+    // ---- Phase 2: Cooperative batch inversion of Z ----
+    // Store Z values and originals in shared memory
+    uint256 my_z = q.z;
+    // Guard against zero Z (point at infinity) — use 1 instead
+    if (uint256_is_zero(my_z)) my_z = uint256_one();
+    inv_origz[tid] = my_z;
+    inv_tree[tid] = my_z;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Up-sweep: parallel prefix products
+    for (uint stride = 1; stride < BATCH_INV_SIZE; stride <<= 1) {
+        uint idx = (tid + 1) * (stride << 1) - 1;
+        if (idx < BATCH_INV_SIZE) {
+            inv_tree[idx] = field_mul(inv_tree[idx - stride], inv_tree[idx]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Single thread inverts the total product
+    if (tid == 0) {
+        inv_tree[BATCH_INV_SIZE - 1] = field_inv(inv_tree[BATCH_INV_SIZE - 1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Down-sweep: distribute inverses (Blelloch scan)
+    for (uint stride = BATCH_INV_SIZE >> 1; stride >= 1; stride >>= 1) {
+        uint idx = (tid + 1) * (stride << 1) - 1;
+        if (idx < BATCH_INV_SIZE) {
+            uint256 left = inv_tree[idx - stride];
+            inv_tree[idx - stride] = inv_tree[idx];
+            inv_tree[idx] = field_mul(inv_tree[idx], left);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Each thread reads its Z inverse
+    uint256 z_inv = inv_tree[tid];
+
+    // ---- Phase 3: Independent per-thread work ----
+    // Convert to affine using z_inv
+    uint256 z2 = field_sqr(z_inv);
+    uint256 z3 = field_mul(z2, z_inv);
+    uint256 ax = field_mul(q.x, z2);
+    uint256 ay = field_mul(q.y, z3);
+
+    // Compress pubkey
+    uchar compressed[33];
+    compressed[0] = (ay.d[0] & 1) ? 0x03 : 0x02;
+    uint256_to_be_thread(ax, compressed+1);
+
+    // HASH160
+    uchar h160[20];
+    hash160_33bytes(compressed, h160);
+
+    // DER check
+    bool valid = params.easy_mode ? check_der_easy(h160) : check_der_20(h160);
+    if (valid) {
+        uint pos = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
+        if (pos < 1024) hit_indices[pos] = gid;
+    }
+}
+
+// ============================================================
 // Test kernels
 // ============================================================
 

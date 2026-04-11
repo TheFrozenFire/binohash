@@ -342,6 +342,98 @@ impl MetalMiner {
         hits
     }
 
+    /// Raw dispatch of a pinning-style kernel with explicit pipeline and threadgroup size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_pinning_batch_raw(
+        &self,
+        pipeline: &ComputePipelineState,
+        midstate: &[u32; 8],
+        suffix: &[u8],
+        total_preimage_len: u32,
+        seq_offset: u32,
+        lt_offset: u32,
+        seq_value: u32,
+        start_lt: u32,
+        batch_size: u32,
+        neg_r_inv: &[u8; 32],
+        u2r_x: &[u8; 32],
+        u2r_y: &[u8; 32],
+        easy_mode: bool,
+        threadgroup_size: u64,
+    ) -> Vec<GpuPinningHit> {
+        let params = PinningParamsGpu {
+            midstate: *midstate,
+            total_preimage_len,
+            suffix_len: suffix.len() as u32,
+            seq_offset,
+            lt_offset,
+            seq_value,
+            start_lt,
+            easy_mode: if easy_mode { 1 } else { 0 },
+            _pad: 0,
+        };
+
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const PinningParamsGpu as *const _,
+            mem::size_of::<PinningParamsGpu>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let suffix_buf = self.device.new_buffer_with_data(
+            suffix.as_ptr() as *const _, suffix.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let neg_r_inv_buf = self.device.new_buffer_with_data(
+            neg_r_inv.as_ptr() as *const _, 32, MTLResourceOptions::StorageModeShared,
+        );
+        let mut u2r_data = [0u8; 64];
+        u2r_data[..32].copy_from_slice(u2r_x);
+        u2r_data[32..].copy_from_slice(u2r_y);
+        let u2r_buf = self.device.new_buffer_with_data(
+            u2r_data.as_ptr() as *const _, 64, MTLResourceOptions::StorageModeShared,
+        );
+        let hit_count_buf = self.device.new_buffer(
+            mem::size_of::<u32>() as u64, MTLResourceOptions::StorageModeShared,
+        );
+        unsafe { *(hit_count_buf.contents() as *mut u32) = 0; }
+        let hit_indices_buf = self.device.new_buffer(
+            (MAX_HITS * mem::size_of::<u32>()) as u64, MTLResourceOptions::StorageModeShared,
+        );
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(&suffix_buf), 0);
+        encoder.set_buffer(2, Some(&neg_r_inv_buf), 0);
+        encoder.set_buffer(3, Some(&u2r_buf), 0);
+        encoder.set_buffer(4, Some(&self.gtable_x_buf), 0);
+        encoder.set_buffer(5, Some(&self.gtable_y_buf), 0);
+        encoder.set_buffer(6, Some(&hit_count_buf), 0);
+        encoder.set_buffer(7, Some(&hit_indices_buf), 0);
+
+        let tg = threadgroup_size.min(pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_threads(
+            MTLSize::new(batch_size as u64, 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        let count = unsafe { *(hit_count_buf.contents() as *const u32) };
+        let count = (count as usize).min(MAX_HITS);
+        let mut hits = Vec::with_capacity(count);
+        let indices_ptr = hit_indices_buf.contents() as *const u32;
+        for i in 0..count {
+            let thread_idx = unsafe { *indices_ptr.add(i) };
+            hits.push(GpuPinningHit {
+                locktime: start_lt + thread_idx,
+                thread_index: thread_idx,
+            });
+        }
+        hits
+    }
+
     /// Get the Metal device.
     pub fn device(&self) -> &Device {
         &self.device

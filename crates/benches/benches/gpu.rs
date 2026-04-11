@@ -81,6 +81,22 @@ fn bench_gpu_pinning_batch(c: &mut Criterion) {
             })
         });
     }
+
+    // Batch inversion pinning kernel (262144 candidates, tg=256)
+    let batch_pipeline = m.make_pipeline("pinning_search_batch");
+    c.bench_function("GPU pinning batch-inv (262144 candidates)", |b| {
+        b.iter(|| {
+            // Reuse the same buffer setup as search_pinning_batch
+            m.search_pinning_batch_raw(
+                &batch_pipeline,
+                &midstate,
+                &suffix,
+                5000, 4, 8, 0xFFFFFFFE, 1, 262144,
+                &neg_r_inv, &u2r_x, &u2r_y, true,
+                256, // explicit threadgroup size
+            )
+        })
+    });
 }
 
 fn bench_cpu_puzzle_comparison(c: &mut Criterion) {
