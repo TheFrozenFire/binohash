@@ -82,6 +82,23 @@ fn gpu_field_mul_known_values() {
 }
 
 #[test]
+fn gpu_field_mul_matches_python() {
+    let m = miner();
+
+    // Verify against Python: a*b mod P for known large values
+    let mut a = [0u8; 32]; a[0] = 0x7F; a[31] = 0x42;
+    let mut b = [0u8; 32]; b[0] = 0x3A; b[31] = 0x99;
+
+    let result = m.test_field_mul(&a, &b);
+    // Python: (0x7F00...42 * 0x3A00...99) mod P =
+    let expected_hex = "aaa6000000000000000000000000000000000000000000001cc60135cfa922ba";
+    assert_eq!(
+        hex(&result), expected_hex,
+        "GPU field_mul should match Python for large inputs"
+    );
+}
+
+#[test]
 fn gpu_field_mul_large_values() {
     let m = miner();
 
@@ -224,4 +241,36 @@ fn gpu_ec_mul_matches_cpu_large_scalar() {
         "GPU EC mul should match CPU for large scalar"
     );
     assert_eq!(hex(&gpu_y), hex(cpu_y));
+}
+
+#[test]
+fn gpu_montgomery_mul_matches_schoolbook() {
+    let m = miner();
+
+    // Test several value pairs — Montgomery mul should produce identical results to schoolbook
+    let test_cases: &[([u8; 32], [u8; 32])] = &[
+        // Small values
+        ({let mut a = [0u8;32]; a[31]=2; a}, {let mut b = [0u8;32]; b[31]=3; b}),
+        // Large values
+        ({let mut a = [0u8;32]; a[0]=0x7F; a[31]=0x42; a},
+         {let mut b = [0u8;32]; b[0]=0x3A; b[31]=0x99; b}),
+        // Generator x-coordinate
+        (
+            [0x79,0xBE,0x66,0x7E,0xF9,0xDC,0xBB,0xAC,0x55,0xA0,0x62,0x95,0xCE,0x87,
+             0x0B,0x07,0x02,0x9B,0xFC,0xDB,0x2D,0xCE,0x28,0xD9,0x59,0xF2,0x81,0x5B,
+             0x16,0xF8,0x17,0x98],
+            [0x48,0x3A,0xDA,0x77,0x26,0xA3,0xC4,0x65,0x5D,0xA4,0xFB,0xFC,0x0E,0x11,
+             0x08,0xA8,0xFD,0x17,0xB4,0x48,0xA6,0x85,0x54,0x19,0x9C,0x47,0xD0,0x8F,
+             0xFB,0x10,0xD4,0xB8],
+        ),
+    ];
+
+    for (i, (a, b)) in test_cases.iter().enumerate() {
+        let schoolbook = m.test_field_mul(a, b);
+        let montgomery = m.run_simple_kernel_2in_1out("test_monty_mul", a, b, 32);
+        assert_eq!(
+            hex(&schoolbook), hex(&montgomery),
+            "Montgomery must match schoolbook for test case {i}"
+        );
+    }
 }

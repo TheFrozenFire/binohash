@@ -127,6 +127,20 @@ fn bench_field_throughput(c: &mut Criterion) {
         &format!("GPU field_inv throughput ({threads}t × {inv_iters}i)"),
         |b| b.iter(|| m.bench_field_op("bench_field_inv_loop", threads, inv_iters)),
     );
+
+    // Montgomery mul throughput (13-bit CIOS)
+    c.bench_function(
+        &format!("GPU monty13_mul throughput ({threads}t × {iters}i = {}M muls)",
+                 threads as u64 * iters as u64 / 1_000_000),
+        |b| b.iter(|| m.bench_field_op("bench_monty_mul", threads, iters)),
+    );
+
+    // Montgomery sqr throughput
+    c.bench_function(
+        &format!("GPU monty13_sqr throughput ({threads}t × {iters}i = {}M sqrs)",
+                 threads as u64 * iters as u64 / 1_000_000),
+        |b| b.iter(|| m.bench_field_op("bench_monty_sqr", threads, iters)),
+    );
 }
 
 criterion_group!(
