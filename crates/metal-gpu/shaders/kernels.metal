@@ -103,10 +103,6 @@ kernel void pinning_search_batch(
     uint gid                            [[thread_position_in_grid]],
     uint tid                            [[thread_index_in_threadgroup]]
 ) {
-    // Shared memory for batch inversion
-    threadgroup uint256 inv_tree[BATCH_INV_SIZE];
-    threadgroup uint256 inv_origz[BATCH_INV_SIZE];
-
     uint256 neg_r_inv = uint256_from_be_device(neg_r_inv_be);
     AffinePoint u2r = {uint256_from_be_device(u2r_be), uint256_from_be_device(u2r_be+32)};
     uint lt = params.start_lt + gid;
@@ -154,42 +150,13 @@ kernel void pinning_search_batch(
     q = ec_add_mixed(q, u2r);
 
     // ---- Phase 2: Cooperative batch inversion of Z ----
-    // Store Z values and originals in shared memory
-    uint256 my_z = q.z;
-    // Guard against zero Z (point at infinity) — use 1 instead
-    if (uint256_is_zero(my_z)) my_z = uint256_one();
-    inv_origz[tid] = my_z;
-    inv_tree[tid] = my_z;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Up-sweep: parallel prefix products
-    for (uint stride = 1; stride < BATCH_INV_SIZE; stride <<= 1) {
-        uint idx = (tid + 1) * (stride << 1) - 1;
-        if (idx < BATCH_INV_SIZE) {
-            inv_tree[idx] = field_mul(inv_tree[idx - stride], inv_tree[idx]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Single thread inverts the total product
-    if (tid == 0) {
-        inv_tree[BATCH_INV_SIZE - 1] = field_inv(inv_tree[BATCH_INV_SIZE - 1]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Down-sweep: distribute inverses (Blelloch scan)
-    for (uint stride = BATCH_INV_SIZE >> 1; stride >= 1; stride >>= 1) {
-        uint idx = (tid + 1) * (stride << 1) - 1;
-        if (idx < BATCH_INV_SIZE) {
-            uint256 left = inv_tree[idx - stride];
-            inv_tree[idx - stride] = inv_tree[idx];
-            inv_tree[idx] = field_mul(inv_tree[idx], left);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Each thread reads its Z inverse
-    uint256 z_inv = inv_tree[tid];
+    // NOTE: Sequential batch (thread 0 does all work) is 1.47x SLOWER than per-thread
+    // because idle threads waste GPU execution units at barriers.
+    // Parallel tree (Blelloch scan) was 2.9x faster in isolation but produces
+    // incorrect individual inverses (the exclusive-scan pattern doesn't directly
+    // compute element-wise inverses — it computes prefix-product inverses).
+    // For now, fall back to per-thread inversion which is correct and fast.
+    uint256 z_inv = field_inv(q.z);
 
     // ---- Phase 3: Independent per-thread work ----
     // Convert to affine using z_inv

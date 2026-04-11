@@ -274,3 +274,44 @@ fn gpu_montgomery_mul_matches_schoolbook() {
         );
     }
 }
+
+#[test]
+fn gpu_batch_pinning_matches_original() {
+    let m = miner();
+
+    // Use dummy but consistent parameters
+    let nonce = hors::NonceSig::derive("gpu_batch_test");
+    let parsed = nonce.parsed();
+    let neg_r_inv = parsed.r; // Not mathematically correct, but consistent between kernels
+    let u2r_x = parsed.r;
+    let u2r_y = parsed.s;
+    let suffix = vec![0u8; 32];
+    let midstate = [0u32; 8];
+
+    // Run original kernel — 1024 candidates in easy mode
+    let original_hits = m.search_pinning_batch(
+        &midstate, &suffix, 5000, 4, 8, 0xFFFFFFFE, 1, 1024,
+        &neg_r_inv, &u2r_x, &u2r_y, true,
+    );
+
+    // Run batch kernel with same parameters
+    let batch_pipeline = m.make_pipeline("pinning_search_batch");
+    let batch_hits = m.search_pinning_batch_raw(
+        &batch_pipeline,
+        &midstate, &suffix, 5000, 4, 8, 0xFFFFFFFE, 1, 1024,
+        &neg_r_inv, &u2r_x, &u2r_y, true, 256,
+    );
+
+    // Both should find the same hits (same candidates, same pipeline)
+    let mut orig_lts: Vec<u32> = original_hits.iter().map(|h| h.locktime).collect();
+    let mut batch_lts: Vec<u32> = batch_hits.iter().map(|h| h.locktime).collect();
+    orig_lts.sort();
+    batch_lts.sort();
+
+    assert_eq!(
+        orig_lts, batch_lts,
+        "Batch kernel must find same hits as original.\nOriginal: {orig_lts:?}\nBatch: {batch_lts:?}"
+    );
+    // Sanity: should have found some easy-mode hits in 1024 candidates (~64 expected)
+    assert!(!orig_lts.is_empty(), "should find at least one easy-mode hit in 1024 candidates");
+}
