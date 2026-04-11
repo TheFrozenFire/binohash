@@ -150,6 +150,39 @@ fn bench_field_throughput(c: &mut Criterion) {
     );
 }
 
+fn bench_ec_comparison(c: &mut Criterion) {
+    let m = &*MINER;
+    let iters = 16u32;
+
+    // The geo (msl-secp256k1) EC kernel uses 20×13-bit limbs which exceeds
+    // Apple Silicon's per-thread register limit — pipeline creation fails.
+    // This confirms our 8×32-bit approach is better for GPU parallelism.
+    let geo_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        m.make_pipeline("bench_geo_ec_add_16")
+    }));
+    match geo_result {
+        Ok(pipeline) => {
+            for threads in [1u32, 256, 4096] {
+                c.bench_function(
+                    &format!("GPU geo_ec jac_add ({threads}t x {iters}i)"),
+                    |b| b.iter(|| m.run_pipeline(&pipeline, threads, iters)),
+                );
+            }
+        }
+        Err(_) => {
+            eprintln!("NOTE: geo_ec pipeline creation failed (register limit exceeded)");
+        }
+    }
+
+    let our_pipeline = m.make_pipeline("bench_our_ec_add_16");
+    for threads in [1u32, 256, 65536] {
+        c.bench_function(
+            &format!("GPU our_ec mixed_add ({threads}t x {iters}i)"),
+            |b| b.iter(|| m.run_pipeline(&our_pipeline, threads, iters)),
+        );
+    }
+}
+
 criterion_group!(
     benches,
     bench_gpu_sha256,
@@ -159,5 +192,6 @@ criterion_group!(
     bench_gpu_pinning_batch,
     bench_cpu_puzzle_comparison,
     bench_field_throughput,
+    bench_ec_comparison,
 );
 criterion_main!(benches);

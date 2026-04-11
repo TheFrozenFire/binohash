@@ -13,6 +13,7 @@ const SHADER_SOURCE: &str = concat!(
     include_str!("../shaders/kernels.metal"),
     include_str!("../shaders/montgomery.metal"),
     include_str!("../shaders/mont_benchmark_comparison.metal"),
+    include_str!("../shaders/ec_comparison.metal"),
 );
 const MAX_HITS: usize = 1024;
 const THREADS_PER_GROUP: u64 = 256;
@@ -64,6 +65,7 @@ pub struct GpuPinningHit {
 pub struct MetalMiner {
     device: Device,
     queue: CommandQueue,
+    library: Library,
     pinning_pipeline: ComputePipelineState,
     // GTable buffers (persistent across batches)
     gtable_x_buf: Buffer,
@@ -105,6 +107,7 @@ impl MetalMiner {
         let mut miner = MetalMiner {
             device,
             queue,
+            library,
             pinning_pipeline,
             gtable_x_buf,
             gtable_y_buf,
@@ -348,19 +351,23 @@ impl MetalMiner {
         self.pinning_pipeline.max_total_threads_per_threadgroup()
     }
 
-    /// Benchmark kernel: run `iterations` of field_mul across `num_threads` GPU threads.
-    /// Returns wall-clock time. The result is chain-dependent to prevent dead-code elimination.
-    pub fn bench_field_op(&self, kernel_name: &str, num_threads: u32, iterations: u32) {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function(kernel_name, None).expect("kernel fn");
-        let pipeline = self
-            .device
+    /// Create a compute pipeline for a named kernel. Cache externally for repeated use.
+    pub fn make_pipeline(&self, kernel_name: &str) -> ComputePipelineState {
+        let function = self.library.get_function(kernel_name, None)
+            .unwrap_or_else(|_| panic!("kernel not found: {kernel_name}"));
+        self.device
             .new_compute_pipeline_state_with_function(&function)
-            .expect("pipeline");
+            .unwrap_or_else(|_| panic!("pipeline failed: {kernel_name}"))
+    }
 
+    /// Benchmark kernel: run `iterations` across `num_threads` GPU threads.
+    pub fn bench_field_op(&self, kernel_name: &str, num_threads: u32, iterations: u32) {
+        let pipeline = self.make_pipeline(kernel_name);
+        self.run_pipeline(&pipeline, num_threads, iterations);
+    }
+
+    /// Run a pre-built pipeline with the standard seed/out/iterations buffer layout.
+    pub fn run_pipeline(&self, pipeline: &ComputePipelineState, num_threads: u32, iterations: u32) {
         let seed: [u8; 32] = [0x42; 32];
         let seed_buf = self.device.new_buffer_with_data(
             seed.as_ptr() as *const _, 32, MTLResourceOptions::StorageModeShared,
@@ -407,11 +414,7 @@ impl MetalMiner {
     /// Run field multiplication (a * b mod P) on the GPU.
     /// All values are 32 big-endian bytes.
     pub fn test_field_mul(&self, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function("test_field_mul", None).expect("fn");
+        let function = self.library.get_function("test_field_mul", None).expect("fn");
         let pipeline = self
             .device
             .new_compute_pipeline_state_with_function(&function)
@@ -445,11 +448,7 @@ impl MetalMiner {
 
     /// Run field inversion on the GPU. Returns (inv, a * inv) — second should be [0..0, 1].
     pub fn test_field_inv(&self, a: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function("test_field_inv", None).expect("fn");
+        let function = self.library.get_function("test_field_inv", None).expect("fn");
         let pipeline = self
             .device
             .new_compute_pipeline_state_with_function(&function)
@@ -484,11 +483,7 @@ impl MetalMiner {
     /// Run EC scalar multiplication: scalar * G via GTable.
     /// Returns uncompressed point (x, y) as 32 BE bytes each.
     pub fn test_ec_mul(&self, scalar: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function("test_ec_mul", None).expect("fn");
+        let function = self.library.get_function("test_ec_mul", None).expect("fn");
         let pipeline = self
             .device
             .new_compute_pipeline_state_with_function(&function)
@@ -531,11 +526,7 @@ impl MetalMiner {
         u2r_x: &[u8; 32],
         u2r_y: &[u8; 32],
     ) -> ([u8; 33], [u8; 20]) {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function("test_ec_recovery", None).expect("fn");
+        let function = self.library.get_function("test_ec_recovery", None).expect("fn");
         let pipeline = self
             .device
             .new_compute_pipeline_state_with_function(&function)
@@ -582,11 +573,7 @@ impl MetalMiner {
 
     /// Helper: run a kernel with single input/output byte buffers.
     fn run_simple_kernel(&self, name: &str, input: &[u8], output_len: usize) -> Vec<u8> {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function(name, None).expect("kernel fn");
+        let function = self.library.get_function(name, None).expect("kernel fn");
         let pipeline = self
             .device
             .new_compute_pipeline_state_with_function(&function)
@@ -627,11 +614,7 @@ impl MetalMiner {
     pub fn run_simple_kernel_2in_1out(
         &self, name: &str, input_a: &[u8], input_b: &[u8], output_len: usize,
     ) -> Vec<u8> {
-        let library = self
-            .device
-            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
-            .expect("compile");
-        let function = library.get_function(name, None).expect("kernel fn");
+        let function = self.library.get_function(name, None).expect("kernel fn");
         let pipeline = self
             .device
             .new_compute_pipeline_state_with_function(&function)
