@@ -182,23 +182,37 @@ uint256 field_mul(uint256 a, uint256 b) {
 
 uint256 field_sqr(uint256 a) { return field_mul(a, a); }
 
+// Repeated squaring helper: compute a^(2^n)
+uint256 field_sqr_n(uint256 a, int n) {
+    for (int i = 0; i < n; i++) a = field_sqr(a);
+    return a;
+}
+
 uint256 field_inv(uint256 a) {
-    // P-2 as big-endian bytes
-    const uchar exp[32] = {
-        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFE, 0xFF,0xFF,0xFC,0x2D
-    };
-    uint256 result = uint256_one();
-    for (int byte_idx = 0; byte_idx < 32; byte_idx++) {
-        uchar b = exp[byte_idx];
-        for (int bit = 7; bit >= 0; bit--) {
-            result = field_sqr(result);
-            if ((b >> bit) & 1) result = field_mul(result, a);
-        }
-    }
-    return result;
+    // Addition chain for a^(P-2) mod P, from libsecp256k1.
+    // P-2 = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+    // 256 squarings + 15 multiplications (vs naive: 256 sqr + 247 mul)
+    uint256 x2 = field_mul(field_sqr(a), a);                   // a^3
+    uint256 x3 = field_mul(field_sqr(x2), a);                  // a^7
+    uint256 x6 = field_mul(field_sqr_n(x3, 3), x3);            // a^63
+    uint256 x9 = field_mul(field_sqr_n(x6, 3), x3);            // a^511
+    uint256 x11 = field_mul(field_sqr_n(x9, 2), x2);           // a^2047
+    uint256 x22 = field_mul(field_sqr_n(x11, 11), x11);        // a^(2^22-1)
+    uint256 x44 = field_mul(field_sqr_n(x22, 22), x22);        // a^(2^44-1)
+    uint256 x88 = field_mul(field_sqr_n(x44, 44), x44);        // a^(2^88-1)
+    uint256 x176 = field_mul(field_sqr_n(x88, 88), x88);       // a^(2^176-1)
+    uint256 x220 = field_mul(field_sqr_n(x176, 44), x44);      // a^(2^220-1)
+    uint256 x223 = field_mul(field_sqr_n(x220, 3), x3);        // a^(2^223-1)
+    // Exponent tail: 2^223-1 then shift and add for ...FE FFFF FC2D
+    uint256 t = field_sqr_n(x223, 23);
+    t = field_mul(t, x22);      // covers the 0xFFFFF part
+    t = field_sqr_n(t, 5);
+    t = field_mul(t, a);        // bit
+    t = field_sqr_n(t, 3);
+    t = field_mul(t, x2);      // 0x...2D tail: ...101101
+    t = field_sqr_n(t, 2);
+    t = field_mul(t, a);
+    return t;
 }
 
 // ============================================================
