@@ -471,3 +471,97 @@ fn gpu_search_params_midstate_produces_correct_sighash() {
     let recomputed_midstate = hash::sha256_midstate(&preimage[..midstate_boundary]);
     assert_eq!(params.midstate, recomputed_midstate);
 }
+
+#[test]
+fn gpu_pinning_hits_verified_by_cpu() {
+    let m = miner();
+    let (tx, full_script, pin_nonce) = build_test_tx_and_script();
+
+    let params = GpuSearchParams::from_pinning_search(
+        pin_nonce.parsed(),
+        &tx,
+        &full_script,
+        &pin_nonce.der_encoded,
+        0,
+    );
+
+    let pin_script_code = script::find_and_delete(&full_script, &pin_nonce.der_encoded);
+    let start_lt: u32 = 1;
+    let batch_size: u32 = 4096;
+    let test_sequence: u32 = 0xFFFFFFFE;
+
+    // Run GPU search with real params in easy mode
+    let gpu_hits = m.search_pinning_batch(
+        &params.midstate,
+        &params.suffix,
+        params.total_preimage_len,
+        params.seq_offset,
+        params.lt_offset,
+        test_sequence,
+        start_lt,
+        batch_size,
+        &params.neg_r_inv,
+        &params.u2r_x,
+        &params.u2r_y,
+        true, // easy mode
+    );
+
+    println!("GPU found {} easy-mode hits in {} candidates", gpu_hits.len(), batch_size);
+    assert!(!gpu_hits.is_empty(), "should find at least one easy-mode hit in 4096 candidates");
+
+    // Verify every GPU hit against CPU
+    let mut cpu_verified = 0;
+    for hit in &gpu_hits {
+        let mut verify_tx = tx.clone();
+        verify_tx.inputs[0].sequence = test_sequence;
+        verify_tx.locktime = hit.locktime;
+
+        let cpu_digest = verify_tx
+            .legacy_sighash(0, &pin_script_code, pin_nonce.parsed().sighash_type)
+            .expect("valid sighash");
+
+        let cpu_hit = puzzle::evaluate_puzzle(
+            pin_nonce.parsed(),
+            cpu_digest,
+            puzzle::SearchMode::EasyTest,
+        );
+
+        assert!(
+            cpu_hit.is_some(),
+            "GPU hit at locktime={} must also be a CPU hit",
+            hit.locktime
+        );
+        cpu_verified += 1;
+    }
+
+    println!("{cpu_verified}/{} GPU hits verified by CPU", gpu_hits.len());
+
+    // Also check for CPU hits that the GPU missed (false negatives)
+    let mut cpu_hits = Vec::new();
+    for lt in start_lt..start_lt + batch_size {
+        let mut verify_tx = tx.clone();
+        verify_tx.inputs[0].sequence = test_sequence;
+        verify_tx.locktime = lt;
+
+        let cpu_digest = verify_tx
+            .legacy_sighash(0, &pin_script_code, pin_nonce.parsed().sighash_type)
+            .expect("valid sighash");
+
+        if puzzle::evaluate_puzzle(
+            pin_nonce.parsed(),
+            cpu_digest,
+            puzzle::SearchMode::EasyTest,
+        ).is_some() {
+            cpu_hits.push(lt);
+        }
+    }
+
+    let mut gpu_lts: Vec<u32> = gpu_hits.iter().map(|h| h.locktime).collect();
+    gpu_lts.sort();
+
+    assert_eq!(
+        gpu_lts, cpu_hits,
+        "GPU and CPU must find identical hit sets.\nGPU: {gpu_lts:?}\nCPU: {cpu_hits:?}"
+    );
+    println!("Perfect parity: {} hits match between GPU and CPU", cpu_hits.len());
+}
