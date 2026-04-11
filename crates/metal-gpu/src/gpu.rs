@@ -2,7 +2,16 @@ use metal::*;
 use std::mem;
 use std::path::Path;
 
-const SHADER_SOURCE: &str = include_str!("../shaders/binohash.metal");
+const SHADER_SOURCE: &str = concat!(
+    include_str!("../shaders/uint256.metal"),
+    include_str!("../shaders/field.metal"),
+    include_str!("../shaders/scalar.metal"),
+    include_str!("../shaders/ec.metal"),
+    include_str!("../shaders/sha256.metal"),
+    include_str!("../shaders/ripemd160.metal"),
+    include_str!("../shaders/der.metal"),
+    include_str!("../shaders/kernels.metal"),
+);
 const MAX_HITS: usize = 1024;
 const THREADS_PER_GROUP: u64 = 256;
 
