@@ -565,3 +565,89 @@ fn gpu_pinning_hits_verified_by_cpu() {
     );
     println!("Perfect parity: {} hits match between GPU and CPU", cpu_hits.len());
 }
+
+#[test]
+fn gpu_cpu_search_parity() {
+    let m = miner();
+    let (tx, full_script, pin_nonce) = build_test_tx_and_script();
+
+    let params = GpuSearchParams::from_pinning_search(
+        pin_nonce.parsed(),
+        &tx,
+        &full_script,
+        &pin_nonce.der_encoded,
+        0,
+    );
+
+    let pin_script_code = script::find_and_delete(&full_script, &pin_nonce.der_encoded);
+    let sequence = 0xFFFFFFFE_u32;
+    let start_lt = 1_u32;
+    let lt_count = 8192_u32;
+
+    // GPU search
+    let gpu_hits = m.search_pinning_batch(
+        &params.midstate,
+        &params.suffix,
+        params.total_preimage_len,
+        params.seq_offset,
+        params.lt_offset,
+        sequence,
+        start_lt,
+        lt_count,
+        &params.neg_r_inv,
+        &params.u2r_x,
+        &params.u2r_y,
+        true,
+    );
+    let mut gpu_lts: Vec<u32> = gpu_hits.iter().map(|h| h.locktime).collect();
+    gpu_lts.sort();
+
+    // CPU search using search::search_pinning with the same parameters
+    let cpu_params = search::PinningSearchParams {
+        tx: &tx,
+        full_script: &full_script,
+        pin_script_code: &pin_script_code,
+        sig_nonce: pin_nonce.parsed(),
+        sig_nonce_bytes: &pin_nonce.der_encoded,
+        search_space: search::PinningSearchSpace {
+            sequence_start: sequence,
+            sequence_count: 1,
+            locktime_start: start_lt,
+            locktime_count: lt_count,
+        },
+        mode: puzzle::SearchMode::EasyTest,
+        input_index: 0,
+        tx_modifier: None,
+    };
+
+    // Collect ALL CPU hits (not just the first)
+    let mut cpu_lts: Vec<u32> = Vec::new();
+    for lt in start_lt..start_lt + lt_count {
+        let mut verify_tx = tx.clone();
+        verify_tx.inputs[0].sequence = sequence;
+        verify_tx.locktime = lt;
+        let digest = verify_tx
+            .legacy_sighash(0, &pin_script_code, pin_nonce.parsed().sighash_type)
+            .expect("valid");
+        if puzzle::evaluate_puzzle(pin_nonce.parsed(), digest, puzzle::SearchMode::EasyTest).is_some() {
+            cpu_lts.push(lt);
+        }
+    }
+
+    // Verify the CPU search function finds a hit (sanity check)
+    let first_cpu_hit = search::search_pinning(cpu_params);
+    assert!(first_cpu_hit.is_some(), "CPU search should find at least one hit");
+    let first_lt = first_cpu_hit.unwrap().locktime;
+    assert!(cpu_lts.contains(&first_lt), "CPU search result should be in our exhaustive set");
+
+    assert_eq!(
+        gpu_lts, cpu_lts,
+        "GPU and CPU must produce identical hit sets over {} candidates.\nGPU found {} hits, CPU found {} hits",
+        lt_count, gpu_lts.len(), cpu_lts.len()
+    );
+
+    println!(
+        "CPU↔GPU parity verified: {}/{} hits match over {} candidates",
+        gpu_lts.len(), cpu_lts.len(), lt_count
+    );
+}
