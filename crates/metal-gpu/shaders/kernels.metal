@@ -578,7 +578,7 @@ struct DigestNthParams {
 
 kernel void digest_search_nth(
     constant DigestNthParams& params     [[buffer(0)]],
-    const device uchar* base_tail        [[buffer(1)]],
+    constant uchar* base_tail            [[buffer(1)]],
     const device uint* dummy_offsets     [[buffer(2)]],
     const device ulong* binom_table      [[buffer(3)]],
     const device uchar* neg_r_inv_be     [[buffer(4)]],
@@ -638,29 +638,36 @@ kernel void digest_search_nth(
         skip_ends[i] = skip_starts[i] + params.dummy_push_len;
     }
 
-    // Stream through base_tail, feeding SHA-256
+    // Build segment boundaries: segments are contiguous runs of bytes between skips
+    uint seg_start[17];
+    uint seg_end[17];
+    seg_start[0] = 0;
+    for (uint i = 0; i < params.t; i++) {
+        seg_end[i] = skip_starts[i];
+        seg_start[i+1] = skip_ends[i];
+    }
+    seg_end[params.t] = params.base_tail_len;
+
+    // Stream through segments (no per-byte skip check), feeding SHA-256
     uint state[8];
     for (int i = 0; i < 8; i++) state[i] = params.midstate[i];
 
     uchar block[64];
     uint block_pos = 0;
-    uint read_pos = 0;
-    uint skip_idx = 0;
 
-    while (read_pos < params.base_tail_len) {
-        if (skip_idx < params.t && read_pos == skip_starts[skip_idx]) {
-            read_pos = skip_ends[skip_idx];
-            skip_idx++;
-            continue;
-        }
-        block[block_pos++] = base_tail[read_pos++];
-        if (block_pos == 64) {
-            uint W[64];
-            for (int i = 0; i < 16; i++)
-                W[i] = ((uint)block[i*4]<<24) | ((uint)block[i*4+1]<<16) |
-                       ((uint)block[i*4+2]<<8) | (uint)block[i*4+3];
-            sha256_compress(state, W);
-            block_pos = 0;
+    for (uint s = 0; s <= params.t; s++) {
+        uint pos = seg_start[s];
+        uint end = seg_end[s];
+        while (pos < end) {
+            block[block_pos++] = base_tail[pos++];
+            if (block_pos == 64) {
+                uint W[64];
+                for (int i = 0; i < 16; i++)
+                    W[i] = ((uint)block[i*4]<<24) | ((uint)block[i*4+1]<<16) |
+                           ((uint)block[i*4+2]<<8) | (uint)block[i*4+3];
+                sha256_compress(state, W);
+                block_pos = 0;
+            }
         }
     }
 
