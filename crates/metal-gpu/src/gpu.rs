@@ -90,6 +90,159 @@ pub struct GpuSearchParams {
     pub u2r_y: [u8; 32],
 }
 
+/// Precomputed parameters for GPU digest search (Round 1 or Round 2).
+#[derive(Debug, Clone)]
+pub struct GpuDigestSearchParams {
+    /// SHA-256 state after processing the fixed prefix (same for all subsets).
+    pub midstate: [u32; 8],
+    /// Length of the fixed prefix (in bytes), for padding calculations.
+    pub prefix_len: u32,
+    /// Base tail template: the bytes from midstate_boundary to end of preimage,
+    /// with the round's nonce sig already FindAndDeleted but dummy sigs intact.
+    pub base_tail: Vec<u8>,
+    /// Offset of each dummy sig's push (including the length prefix) within base_tail.
+    /// dummy_offsets.len() == n (the pool size).
+    pub dummy_offsets: Vec<u32>,
+    /// Length of each dummy sig push (e.g., 10 bytes for 9-byte sigs + 1 length prefix).
+    pub dummy_push_len: u32,
+    /// -r^(-1) mod N for the round's nonce sig.
+    pub neg_r_inv: [u8; 32],
+    /// u2*R x-coordinate.
+    pub u2r_x: [u8; 32],
+    /// u2*R y-coordinate.
+    pub u2r_y: [u8; 32],
+}
+
+impl GpuDigestSearchParams {
+    /// Build digest search params from a round's nonce sig, transaction, and full script.
+    ///
+    /// `t` is the subset size (number of selected dummy sigs per candidate).
+    /// The resulting params describe the shared midstate (fixed prefix) and the
+    /// template tail. For each subset, the GPU will apply FindAndDelete to remove
+    /// the selected dummy sigs from the tail.
+    pub fn from_digest_search(
+        sig_nonce: &ParsedDerSig,
+        sig_nonce_bytes: &[u8],
+        dummy_sigs: &[Vec<u8>],
+        tx: &Transaction,
+        full_script: &[u8],
+        input_index: usize,
+        t: usize,
+    ) -> Self {
+        let secp = Secp256k1::new();
+
+        // ---- Scalar precomputations (same as pinning) ----
+        let r_inv = scalar_inv(&sig_nonce.r);
+        let neg_r_inv = scalar_negate(&r_inv);
+        let u2 = scalar_mul_mod(&sig_nonce.s, &r_inv);
+
+        let mut r_compressed = [0u8; 33];
+        r_compressed[0] = 0x02;
+        r_compressed[1..].copy_from_slice(&sig_nonce.r);
+        let r_point = PublicKey::from_slice(&r_compressed).expect("r is a valid x-coordinate");
+
+        let u2_scalar = Scalar::from_be_bytes(u2).expect("valid scalar");
+        let u2r = r_point.mul_tweak(&secp, &u2_scalar).expect("valid tweak");
+        let u2r_uncompressed = u2r.serialize_uncompressed();
+        let mut u2r_x = [0u8; 32];
+        let mut u2r_y = [0u8; 32];
+        u2r_x.copy_from_slice(&u2r_uncompressed[1..33]);
+        u2r_y.copy_from_slice(&u2r_uncompressed[33..65]);
+
+        // ---- Base script code: full script with nonce sig removed ----
+        let base_script_code = find_and_delete(full_script, sig_nonce_bytes);
+
+        // ---- Build the base preimage (no dummies removed yet) ----
+        // The script_code_len varint in this preimage encodes base_script_code.len().
+        // But the CPU's final preimage has a varint encoding the length AFTER dummy
+        // removal. We patch the varint to reflect the final length (constant per round
+        // since t is fixed).
+        let dummy_push_len_usize = script::push_data(&dummy_sigs[0]).len();
+        let final_script_code_len = base_script_code.len() - t * dummy_push_len_usize;
+
+        let mut base_preimage = tx
+            .legacy_sighash_preimage(input_index, &base_script_code, sig_nonce.sighash_type)
+            .expect("valid preimage");
+
+        // Patch the script_code_len varint. For our script sizes (~1.5KB to ~10KB),
+        // this is a 3-byte varint: 0xfd followed by 2 bytes little-endian.
+        // Varint starts at offset: 4 (version) + 1 (input_count) + 32 (txid) + 4 (vout) = 41
+        let varint_offset = 41;
+        assert_eq!(
+            base_preimage[varint_offset], 0xfd,
+            "expected 3-byte varint for script_code_len (got {:02x})",
+            base_preimage[varint_offset]
+        );
+        assert!(
+            (253..=65535).contains(&final_script_code_len),
+            "final script_code_len must fit in a 3-byte varint (got {final_script_code_len})"
+        );
+        base_preimage[varint_offset + 1] = (final_script_code_len & 0xff) as u8;
+        base_preimage[varint_offset + 2] = ((final_script_code_len >> 8) & 0xff) as u8;
+
+        // ---- Find dummy sig positions in the base preimage ----
+        // Each dummy sig is pushed with its length prefix (for 9-byte sigs, that's "09" + 9 bytes).
+        // We need to find where each dummy's push appears in the base_preimage.
+        let mut dummy_offsets = Vec::with_capacity(dummy_sigs.len());
+        let dummy_push_len = {
+            let sample_push = script::push_data(&dummy_sigs[0]);
+            sample_push.len() as u32
+        };
+
+        for (di, dummy) in dummy_sigs.iter().enumerate() {
+            let push = script::push_data(dummy);
+            // Find ALL occurrences and take the last one (Round 2 dummies are at the
+            // end of the script, so the last occurrence is the correct one).
+            let mut positions: Vec<usize> = Vec::new();
+            let mut start = 0;
+            while let Some(p) = find_subsequence(&base_preimage[start..], &push) {
+                positions.push(start + p);
+                start = start + p + 1;
+            }
+            assert!(
+                !positions.is_empty(),
+                "dummy sig {di} not found in preimage"
+            );
+            // Use the LAST occurrence (Round 2 dummies are at the end of the script)
+            let pos = *positions.last().unwrap();
+            dummy_offsets.push(pos as u32);
+        }
+
+        // ---- Determine the midstate boundary ----
+        // It must be at a 64-byte boundary BEFORE the lowest dummy offset.
+        let min_dummy_offset = *dummy_offsets.iter().min().expect("at least one dummy");
+        let midstate_boundary = ((min_dummy_offset / 64) * 64) as usize;
+
+        let prefix = &base_preimage[..midstate_boundary];
+        let base_tail = base_preimage[midstate_boundary..].to_vec();
+
+        // Adjust dummy offsets to be relative to base_tail
+        for offset in dummy_offsets.iter_mut() {
+            *offset -= midstate_boundary as u32;
+        }
+
+        let midstate = hash::sha256_midstate(prefix);
+
+        GpuDigestSearchParams {
+            midstate,
+            prefix_len: midstate_boundary as u32,
+            base_tail,
+            dummy_offsets,
+            dummy_push_len,
+            neg_r_inv,
+            u2r_x,
+            u2r_y,
+        }
+    }
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 impl GpuSearchParams {
     /// Build GPU search parameters from a pinning nonce signature, transaction
     /// template, and script code.
@@ -722,6 +875,128 @@ impl MetalMiner {
                 locktime: start_lt + candidate_idx,
                 thread_index: candidate_idx,
             });
+        }
+        hits
+    }
+
+    /// Run a digest search batch on the GPU.
+    ///
+    /// Evaluates `num_candidates` subsets against the hash-to-sig puzzle.
+    /// Each candidate's subset indices are taken from `subsets[i*t .. i*t + t]`.
+    /// Returns the indices (within the batch) of subsets that produced hits.
+    pub fn search_digest_batch(
+        &self,
+        params: &GpuDigestSearchParams,
+        subsets: &[u32],
+        t: u32,
+        n: u32,
+        num_candidates: u32,
+        easy_mode: bool,
+    ) -> Vec<u32> {
+        assert_eq!(
+            subsets.len(), (num_candidates * t) as usize,
+            "subsets buffer must have num_candidates*t entries"
+        );
+
+        #[repr(C)]
+        struct DigestParamsGpu {
+            midstate: [u32; 8],
+            total_preimage_len: u32,
+            base_tail_len: u32,
+            dummy_push_len: u32,
+            t: u32,
+            n: u32,
+            easy_mode: u32,
+            _pad: u32,
+        }
+
+        // After FindAndDelete of selected dummies, each subset removes t*dummy_push_len bytes.
+        let bytes_removed = t * params.dummy_push_len;
+        let total_preimage_len = params.prefix_len + params.base_tail.len() as u32 - bytes_removed;
+
+        let gpu_params = DigestParamsGpu {
+            midstate: params.midstate,
+            total_preimage_len,
+            base_tail_len: params.base_tail.len() as u32,
+            dummy_push_len: params.dummy_push_len,
+            t,
+            n,
+            easy_mode: if easy_mode { 1 } else { 0 },
+            _pad: 0,
+        };
+
+        let pipeline = self.make_pipeline("digest_search");
+
+        let params_buf = self.device.new_buffer_with_data(
+            &gpu_params as *const DigestParamsGpu as *const _,
+            mem::size_of::<DigestParamsGpu>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let base_tail_buf = self.device.new_buffer_with_data(
+            params.base_tail.as_ptr() as *const _,
+            params.base_tail.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let dummy_offsets_buf = self.device.new_buffer_with_data(
+            params.dummy_offsets.as_ptr() as *const _,
+            (params.dummy_offsets.len() * mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let subsets_buf = self.device.new_buffer_with_data(
+            subsets.as_ptr() as *const _,
+            (subsets.len() * mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let neg_r_inv_buf = self.device.new_buffer_with_data(
+            params.neg_r_inv.as_ptr() as *const _, 32,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let mut u2r_data = [0u8; 64];
+        u2r_data[..32].copy_from_slice(&params.u2r_x);
+        u2r_data[32..].copy_from_slice(&params.u2r_y);
+        let u2r_buf = self.device.new_buffer_with_data(
+            u2r_data.as_ptr() as *const _, 64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let hit_count_buf = self.device.new_buffer(
+            mem::size_of::<u32>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe { *(hit_count_buf.contents() as *mut u32) = 0; }
+        let hit_indices_buf = self.device.new_buffer(
+            (MAX_HITS * mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(&base_tail_buf), 0);
+        encoder.set_buffer(2, Some(&dummy_offsets_buf), 0);
+        encoder.set_buffer(3, Some(&subsets_buf), 0);
+        encoder.set_buffer(4, Some(&neg_r_inv_buf), 0);
+        encoder.set_buffer(5, Some(&u2r_buf), 0);
+        encoder.set_buffer(6, Some(&self.gtable_x_buf), 0);
+        encoder.set_buffer(7, Some(&self.gtable_y_buf), 0);
+        encoder.set_buffer(8, Some(&hit_count_buf), 0);
+        encoder.set_buffer(9, Some(&hit_indices_buf), 0);
+
+        let tg = THREADS_PER_GROUP.min(pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_threads(
+            MTLSize::new(num_candidates as u64, 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        let count = unsafe { *(hit_count_buf.contents() as *const u32) };
+        let count = (count as usize).min(MAX_HITS);
+        let mut hits = Vec::with_capacity(count);
+        let indices_ptr = hit_indices_buf.contents() as *const u32;
+        for i in 0..count {
+            hits.push(unsafe { *indices_ptr.add(i) });
         }
         hits
     }

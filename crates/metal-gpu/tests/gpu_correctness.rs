@@ -1,4 +1,4 @@
-use metal_gpu::{GpuSearchParams, MetalMiner};
+use metal_gpu::{GpuDigestSearchParams, GpuSearchParams, MetalMiner};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -714,5 +714,221 @@ fn gpu_batched_kernel_matches_original() {
     println!(
         "Batched kernel matches original: {}/{} hits over {} candidates",
         batch_lts.len(), orig_lts.len(), batch_size
+    );
+}
+
+#[test]
+fn gpu_digest_search_matches_cpu() {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let m = miner();
+
+    // Build a full QSB scenario (test config: n=20, t=2+0)
+    let config = script::QsbConfig::test();
+    let pin_nonce = hors::NonceSig::derive("digest_test_pin");
+    let round1_nonce = hors::NonceSig::derive("digest_test_r1");
+    let round2_nonce = hors::NonceSig::derive("digest_test_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(123);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments.clone(), hors2.commitments.clone()],
+        &[dummy1.clone(), dummy2.clone()],
+    );
+
+    let mut tx = tx::Transaction::new(2, 100);
+    tx.add_input(tx::TxIn {
+        txid: [0xDD; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 50_000,
+        script_pubkey: vec![
+            0x76, 0xa9, 0x14,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x88, 0xac,
+        ],
+    });
+
+    // Test Round 2 digest search
+    let dummy2_vecs: Vec<Vec<u8>> = dummy2.iter().map(|d| d.to_vec()).collect();
+    let params = GpuDigestSearchParams::from_digest_search(
+        round2_nonce.parsed(),
+        &round2_nonce.der_encoded,
+        &dummy2_vecs,
+        &tx,
+        &full_script,
+        0,
+        2, // t = 2
+    );
+
+    // Enumerate all C(n=20, t=2) = 190 subsets
+    let n = 20;
+    let t = 2;
+    let all_subsets: Vec<Vec<usize>> = subset::CombinationIter::new(n, t).collect();
+    assert_eq!(all_subsets.len(), 190);
+
+    // Pack subsets into a flat u32 buffer for GPU
+    let subsets_flat: Vec<u32> = all_subsets
+        .iter()
+        .flat_map(|s: &Vec<usize>| s.iter().map(|&i| i as u32))
+        .collect();
+
+    // Run GPU digest search
+    let gpu_hits = m.search_digest_batch(
+        &params,
+        &subsets_flat,
+        t as u32,
+        n as u32,
+        all_subsets.len() as u32,
+        true, // easy mode for faster testing
+    );
+    // CPU reference: for each subset, verify against puzzle::evaluate_puzzle
+    let base_script_code = script::find_and_delete(&full_script, &round2_nonce.der_encoded);
+    let mut cpu_hit_indices = Vec::new();
+    for (subset_idx, combo) in all_subsets.iter().enumerate() {
+        let mut script_code = base_script_code.clone();
+        for &idx in combo {
+            script_code = script::find_and_delete(&script_code, &dummy2[idx]);
+        }
+        let digest = tx
+            .legacy_sighash(0, &script_code, round2_nonce.parsed().sighash_type)
+            .expect("valid sighash");
+        if puzzle::evaluate_puzzle(
+            round2_nonce.parsed(),
+            digest,
+            puzzle::SearchMode::EasyTest,
+        ).is_some() {
+            cpu_hit_indices.push(subset_idx as u32);
+        }
+    }
+    let mut gpu_sorted = gpu_hits.clone();
+    gpu_sorted.sort();
+    assert_eq!(
+        gpu_sorted, cpu_hit_indices,
+        "GPU digest search must produce identical hits to CPU"
+    );
+    assert!(!cpu_hit_indices.is_empty(), "Should find at least one easy-mode hit");
+    println!("Perfect parity: {} hits match over 190 subsets", cpu_hit_indices.len());
+}
+
+#[test]
+fn gpu_digest_search_config_a_first_batch() {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let m = miner();
+
+    // Config A: n=150, t=9
+    let config = script::QsbConfig::config_a();
+    let pin_nonce = hors::NonceSig::derive("config_a_pin");
+    let round1_nonce = hors::NonceSig::derive("config_a_r1");
+    let round2_nonce = hors::NonceSig::derive("config_a_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(99);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments, hors2.commitments],
+        &[dummy1, dummy2.clone()],
+    );
+
+    let mut tx = tx::Transaction::new(2, 0);
+    tx.add_input(tx::TxIn {
+        txid: [0xFF; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 100_000,
+        script_pubkey: vec![
+            0x76, 0xa9, 0x14,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x88, 0xac,
+        ],
+    });
+
+    let t = config.t2_total();
+    let n = config.n;
+    let dummy2_vecs: Vec<Vec<u8>> = dummy2.iter().map(|d| d.to_vec()).collect();
+    let params = GpuDigestSearchParams::from_digest_search(
+        round2_nonce.parsed(),
+        &round2_nonce.der_encoded,
+        &dummy2_vecs,
+        &tx,
+        &full_script,
+        0,
+        t,
+    );
+
+    // Test a small batch of 2048 subsets (fast to verify)
+    let batch_size = 2048_usize;
+    let subsets: Vec<u32> = (0..batch_size as u128)
+        .flat_map(|idx| {
+            let combo = subset::nth_combination(n, t, idx).expect("valid");
+            combo.into_iter().map(|i| i as u32).collect::<Vec<_>>()
+        })
+        .collect();
+
+    // GPU
+    let gpu_hits = m.search_digest_batch(
+        &params,
+        &subsets,
+        t as u32,
+        n as u32,
+        batch_size as u32,
+        true, // easy mode
+    );
+    let mut gpu_sorted = gpu_hits.clone();
+    gpu_sorted.sort();
+
+    // CPU reference
+    let base_script_code = script::find_and_delete(&full_script, &round2_nonce.der_encoded);
+    let mut cpu_hits = Vec::new();
+    for idx in 0..batch_size as u128 {
+        let combo = subset::nth_combination(n, t, idx).expect("valid");
+        let mut script_code = base_script_code.clone();
+        for &di in &combo {
+            script_code = script::find_and_delete(&script_code, &dummy2[di]);
+        }
+        let digest = tx
+            .legacy_sighash(0, &script_code, round2_nonce.parsed().sighash_type)
+            .expect("valid sighash");
+        if puzzle::evaluate_puzzle(
+            round2_nonce.parsed(),
+            digest,
+            puzzle::SearchMode::EasyTest,
+        ).is_some() {
+            cpu_hits.push(idx as u32);
+        }
+    }
+
+    assert_eq!(
+        gpu_sorted, cpu_hits,
+        "Config A parity mismatch: GPU={} CPU={} hits",
+        gpu_sorted.len(), cpu_hits.len()
+    );
+    println!(
+        "Config A Round 2 parity: {}/{} hits match over {} subsets",
+        gpu_sorted.len(), cpu_hits.len(), batch_size
     );
 }

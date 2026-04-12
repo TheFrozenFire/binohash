@@ -395,6 +395,164 @@ kernel void pinning_search_batched(
     }
 }
 
+// ============================================================
+// Digest search kernel — Round 1 or Round 2
+//
+// Each thread processes one C(n,t) subset. The kernel reads subset indices
+// from a device buffer, applies FindAndDelete to the base tail (skipping
+// selected dummy sig regions), continues SHA-256 from the midstate, and
+// runs the standard EC recovery + HASH160 + DER check pipeline.
+// ============================================================
+
+struct DigestParams {
+    uint midstate[8];
+    uint total_preimage_len;   // length AFTER FindAndDelete of selected dummies
+    uint base_tail_len;         // length of base_tail (all dummies present)
+    uint dummy_push_len;        // bytes per dummy sig push (constant, e.g., 10)
+    uint t;                     // subset size
+    uint n;                     // pool size
+    uint easy_mode;
+    uint _pad;
+};
+
+kernel void digest_search(
+    constant DigestParams& params        [[buffer(0)]],
+    const device uchar* base_tail        [[buffer(1)]],
+    const device uint* dummy_offsets     [[buffer(2)]],
+    const device uint* subset_indices    [[buffer(3)]],
+    const device uchar* neg_r_inv_be     [[buffer(4)]],
+    const device uchar* u2r_be           [[buffer(5)]],
+    const device uchar* gtable_x         [[buffer(6)]],
+    const device uchar* gtable_y         [[buffer(7)]],
+    device atomic_uint* hit_count        [[buffer(8)]],
+    device uint* hit_indices             [[buffer(9)]],
+    uint gid                             [[thread_position_in_grid]]
+) {
+    uint256 neg_r_inv = uint256_from_be_device(neg_r_inv_be);
+    AffinePoint u2r = {uint256_from_be_device(u2r_be), uint256_from_be_device(u2r_be+32)};
+
+    // Read this candidate's subset indices (max t=16 supported)
+    uint subset[16];
+    for (uint i = 0; i < params.t; i++) {
+        subset[i] = subset_indices[gid * params.t + i];
+    }
+
+    // Compute skip ranges for each selected dummy, then sort by offset
+    // (NOT by subset index — dummies are pushed in reverse in build_round_script,
+    //  so higher indices have lower offsets).
+    uint skip_starts[16];
+    for (uint i = 0; i < params.t; i++) {
+        skip_starts[i] = dummy_offsets[subset[i]];
+    }
+    // Insertion sort on skip_starts (ascending by offset)
+    for (uint i = 1; i < params.t; i++) {
+        uint key = skip_starts[i];
+        int j = (int)i - 1;
+        while (j >= 0 && skip_starts[j] > key) {
+            skip_starts[j+1] = skip_starts[j];
+            j--;
+        }
+        skip_starts[j+1] = key;
+    }
+    uint skip_ends[16];
+    for (uint i = 0; i < params.t; i++) {
+        skip_ends[i] = skip_starts[i] + params.dummy_push_len;
+    }
+
+    // Stream through base_tail, skipping selected dummy regions, feeding SHA-256
+    uint state[8];
+    for (int i = 0; i < 8; i++) state[i] = params.midstate[i];
+
+    uchar block[64];
+    uint block_pos = 0;
+    uint read_pos = 0;
+    uint skip_idx = 0;
+
+    while (read_pos < params.base_tail_len) {
+        // Skip over selected dummy regions
+        if (skip_idx < params.t && read_pos == skip_starts[skip_idx]) {
+            read_pos = skip_ends[skip_idx];
+            skip_idx++;
+            continue;
+        }
+
+        block[block_pos++] = base_tail[read_pos++];
+
+        if (block_pos == 64) {
+            uint W[64];
+            for (int i = 0; i < 16; i++)
+                W[i] = ((uint)block[i*4]<<24) | ((uint)block[i*4+1]<<16) |
+                       ((uint)block[i*4+2]<<8) | (uint)block[i*4+3];
+            sha256_compress(state, W);
+            block_pos = 0;
+        }
+    }
+
+    ulong bit_len = (ulong)params.total_preimage_len * 8;
+
+    // SHA-256 padding: append 0x80, zeros, then 64-bit length
+    block[block_pos++] = 0x80;
+    if (block_pos > 56) {
+        // Finish this block with zeros, compress it, then start a new block for length
+        while (block_pos < 64) block[block_pos++] = 0;
+        uint W[64];
+        for (int i = 0; i < 16; i++)
+            W[i] = ((uint)block[i*4]<<24) | ((uint)block[i*4+1]<<16) |
+                   ((uint)block[i*4+2]<<8) | (uint)block[i*4+3];
+        sha256_compress(state, W);
+        block_pos = 0;
+    }
+    // Fill with zeros up to byte 56
+    while (block_pos < 56) block[block_pos++] = 0;
+    // Append 64-bit length (big-endian)
+    block[56] = (uchar)(bit_len >> 56);
+    block[57] = (uchar)(bit_len >> 48);
+    block[58] = (uchar)(bit_len >> 40);
+    block[59] = (uchar)(bit_len >> 32);
+    block[60] = (uchar)(bit_len >> 24);
+    block[61] = (uchar)(bit_len >> 16);
+    block[62] = (uchar)(bit_len >> 8);
+    block[63] = (uchar)(bit_len);
+    {
+        uint W[64];
+        for (int i = 0; i < 16; i++)
+            W[i] = ((uint)block[i*4]<<24) | ((uint)block[i*4+1]<<16) |
+                   ((uint)block[i*4+2]<<8) | (uint)block[i*4+3];
+        sha256_compress(state, W);
+    }
+
+    // First hash done; second SHA-256 to complete sighash = sha256d
+    uchar first_hash[32];
+    for (int i = 0; i < 8; i++) {
+        first_hash[i*4]   = (uchar)(state[i] >> 24);
+        first_hash[i*4+1] = (uchar)(state[i] >> 16);
+        first_hash[i*4+2] = (uchar)(state[i] >> 8);
+        first_hash[i*4+3] = (uchar)(state[i]);
+    }
+    uchar sighash[32];
+    sha256_32bytes(first_hash, sighash);
+
+    // EC recovery (same as pinning)
+    uint256 z = uint256_from_be_thread(sighash);
+    uint256 u1 = scalar_mul(neg_r_inv, z);
+    JacobianPoint q = ec_mul_gtable(u1, gtable_x, gtable_y);
+    q = ec_add_mixed(q, u2r);
+    AffinePoint qa = jacobian_to_affine(q);
+
+    uchar compressed[33];
+    compressed[0] = (qa.y.d[0]&1) ? 0x03 : 0x02;
+    uint256_to_be_thread(qa.x, compressed+1);
+
+    uchar h160[20];
+    hash160_33bytes(compressed, h160);
+
+    bool valid = params.easy_mode ? check_der_easy(h160) : check_der_20(h160);
+    if (valid) {
+        uint pos = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
+        if (pos < 1024) hit_indices[pos] = gid;
+    }
+}
+
 kernel void test_scalar_mul(
     const device uchar* a_be    [[buffer(0)]],
     const device uchar* b_be    [[buffer(1)]],

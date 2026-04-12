@@ -168,6 +168,86 @@ fn bench_gpu_pinning_batched(c: &mut Criterion) {
     }
 }
 
+fn bench_gpu_digest_search_r2(c: &mut Criterion) {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let m = &*MINER;
+
+    // Build a realistic Config A scenario (n=150, t=9)
+    let config = script::QsbConfig::config_a();
+    let pin_nonce = hors::NonceSig::derive("bench_digest_pin");
+    let round1_nonce = hors::NonceSig::derive("bench_digest_r1");
+    let round2_nonce = hors::NonceSig::derive("bench_digest_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments, hors2.commitments],
+        &[dummy1, dummy2.clone()],
+    );
+
+    let mut tx = tx::Transaction::new(2, 0);
+    tx.add_input(tx::TxIn {
+        txid: [0xEE; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 50_000,
+        script_pubkey: vec![
+            0x76, 0xa9, 0x14,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x88, 0xac,
+        ],
+    });
+
+    let t = config.t2_total();
+    let n = config.n;
+
+    let dummy2_vecs: Vec<Vec<u8>> = dummy2.iter().map(|d| d.to_vec()).collect();
+    let params = metal_gpu::GpuDigestSearchParams::from_digest_search(
+        round2_nonce.parsed(),
+        &round2_nonce.der_encoded,
+        &dummy2_vecs,
+        &tx,
+        &full_script,
+        0,
+        t,
+    );
+
+    // Enumerate a batch of 65536 subsets by index
+    let batch_size: usize = 65536;
+    let subsets: Vec<u32> = (0..batch_size as u128)
+        .flat_map(|idx| {
+            let combo = subset::nth_combination(n, t, idx).expect("valid combination");
+            combo.into_iter().map(|i| i as u32).collect::<Vec<_>>()
+        })
+        .collect();
+
+    c.bench_function("GPU digest Round 2 (n=150 t=9, 65536 subsets)", |b| {
+        b.iter(|| {
+            m.search_digest_batch(
+                black_box(&params),
+                black_box(&subsets),
+                t as u32,
+                n as u32,
+                batch_size as u32,
+                true,
+            )
+        })
+    });
+}
+
 fn bench_cpu_puzzle_comparison(c: &mut Criterion) {
     // CPU baseline: evaluate_puzzle (the per-candidate bottleneck)
     let r = ecdsa_recovery::derive_valid_xcoord("bench_r");
@@ -374,6 +454,7 @@ criterion_group!(
     bench_gpu_ec_mul,
     bench_gpu_pinning_batch,
     bench_gpu_pinning_batched,
+    bench_gpu_digest_search_r2,
     bench_cpu_puzzle_comparison,
     bench_field_throughput,
     bench_hash_throughput,
