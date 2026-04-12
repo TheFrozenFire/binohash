@@ -591,6 +591,7 @@ dependencies = [
  "script",
  "search",
  "secp256k1 0.31.1",
+ "subset",
  "thiserror",
  "tx",
 ]
