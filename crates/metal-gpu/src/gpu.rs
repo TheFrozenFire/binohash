@@ -1006,6 +1006,10 @@ impl MetalMiner {
     /// Instead of precomputing subsets on CPU, each GPU thread computes its
     /// own subset via nth_combination(n, t, start_index + gid) using a
     /// binomial coefficient table. Eliminates CPU preprocessing overhead.
+    ///
+    /// Returns global candidate indices (u64) — the absolute position in
+    /// the C(n,t) search space. Callers can use these directly to look up
+    /// the corresponding subset via `subset::nth_combination`.
     #[allow(clippy::too_many_arguments)]
     pub fn search_digest_batch_nth(
         &self,
@@ -1015,7 +1019,7 @@ impl MetalMiner {
         start_index: u64,
         num_candidates: u32,
         easy_mode: bool,
-    ) -> Vec<u32> {
+    ) -> Vec<u64> {
         #[repr(C)]
         struct DigestNthParamsGpu {
             midstate: [u32; 8],
@@ -1128,10 +1132,11 @@ impl MetalMiner {
 
         let count = unsafe { *(hit_count_buf.contents() as *const u32) };
         let count = (count as usize).min(MAX_HITS);
-        let mut hits = Vec::with_capacity(count);
+        let mut hits: Vec<u64> = Vec::with_capacity(count);
         let indices_ptr = hit_indices_buf.contents() as *const u32;
         for i in 0..count {
-            hits.push(unsafe { *indices_ptr.add(i) });
+            let local = unsafe { *indices_ptr.add(i) } as u64;
+            hits.push(start_index + local);
         }
         hits
     }

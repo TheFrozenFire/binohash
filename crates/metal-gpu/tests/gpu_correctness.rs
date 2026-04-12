@@ -1216,7 +1216,8 @@ fn gpu_digest_search_nth_matches_precomputed() {
         &params, t as u32, n as u32, start_index, batch_size, true,
     );
 
-    let mut a = hits_precomputed.clone();
+    // Convert precomputed (local u32 indices) to global u64 indices
+    let mut a: Vec<u64> = hits_precomputed.iter().map(|&i| start_index + i as u64).collect();
     a.sort();
     let mut b = hits_nth.clone();
     b.sort();
@@ -1229,5 +1230,98 @@ fn gpu_digest_search_nth_matches_precomputed() {
     println!(
         "nth_combination parity: {}/{} hits match over {} subsets",
         b.len(), a.len(), batch_size
+    );
+}
+
+/// Simulates a multi-GPU run by splitting a search range into non-overlapping
+/// chunks and verifying the union of chunk hits equals a single contiguous run.
+///
+/// For a real multi-GPU setup, each chunk would run on a separate MetalMiner
+/// instance (one per GPU), with results merged at the end.
+#[test]
+fn gpu_digest_search_multi_worker_split() {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let m = miner();
+    let config = script::QsbConfig::config_a();
+    let pin_nonce = hors::NonceSig::derive("split_pin");
+    let round1_nonce = hors::NonceSig::derive("split_r1");
+    let round2_nonce = hors::NonceSig::derive("split_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(77);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments, hors2.commitments],
+        &[dummy1, dummy2.clone()],
+    );
+
+    let mut tx = tx::Transaction::new(2, 0);
+    tx.add_input(tx::TxIn {
+        txid: [0x44; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 50_000,
+        script_pubkey: vec![
+            0x76, 0xa9, 0x14,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x88, 0xac,
+        ],
+    });
+
+    let t = config.t2_total();
+    let n = config.n;
+    let dummy2_vecs: Vec<Vec<u8>> = dummy2.iter().map(|d| d.to_vec()).collect();
+    let params = GpuDigestSearchParams::from_digest_search(
+        round2_nonce.parsed(),
+        &round2_nonce.der_encoded,
+        &dummy2_vecs,
+        &tx,
+        &full_script,
+        0,
+        t,
+    );
+
+    // Single-worker run: search [start, start + 4096)
+    let start = 1_000_000_u64;
+    let total = 4096_u32;
+    let single_hits = m.search_digest_batch_nth(
+        &params, t as u32, n as u32, start, total, true,
+    );
+
+    // Multi-worker simulation: split into 4 non-overlapping chunks
+    let chunk_size = total / 4;
+    let mut multi_hits: Vec<u64> = Vec::new();
+    for i in 0..4 {
+        let chunk_start = start + (i * chunk_size) as u64;
+        let chunk_hits = m.search_digest_batch_nth(
+            &params, t as u32, n as u32, chunk_start, chunk_size, true,
+        );
+        multi_hits.extend(chunk_hits);
+    }
+
+    let mut a = single_hits.clone();
+    a.sort();
+    let mut b = multi_hits.clone();
+    b.sort();
+
+    assert_eq!(
+        a, b,
+        "Multi-worker split must produce identical hits to single run"
+    );
+    println!(
+        "Multi-worker split verified: {} hits in [{}..{}) match across 4 chunks of {}",
+        a.len(), start, start + total as u64, chunk_size
     );
 }
