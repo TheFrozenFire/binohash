@@ -1001,6 +1001,141 @@ impl MetalMiner {
         hits
     }
 
+    /// Run digest search with on-GPU nth_combination computation.
+    ///
+    /// Instead of precomputing subsets on CPU, each GPU thread computes its
+    /// own subset via nth_combination(n, t, start_index + gid) using a
+    /// binomial coefficient table. Eliminates CPU preprocessing overhead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_digest_batch_nth(
+        &self,
+        params: &GpuDigestSearchParams,
+        t: u32,
+        n: u32,
+        start_index: u64,
+        num_candidates: u32,
+        easy_mode: bool,
+    ) -> Vec<u32> {
+        #[repr(C)]
+        struct DigestNthParamsGpu {
+            midstate: [u32; 8],
+            total_preimage_len: u32,
+            base_tail_len: u32,
+            dummy_push_len: u32,
+            t: u32,
+            n: u32,
+            easy_mode: u32,
+            binom_stride: u32,
+            start_index_lo: u32,
+            start_index_hi: u32,
+            _pad0: u32,
+            _pad1: u32,
+        }
+
+        // Build binomial coefficient table: rows 0..n, cols 0..=t
+        let binom_stride = (t + 1) as usize;
+        let mut binom_table = vec![0u64; (n as usize) * binom_stride];
+        for row in 0..(n as usize) {
+            for col in 0..=(t as usize) {
+                let coef = subset::binomial_coefficient(row, col);
+                binom_table[row * binom_stride + col] = coef.min(u64::MAX as u128) as u64;
+            }
+        }
+
+        let bytes_removed = t * params.dummy_push_len;
+        let total_preimage_len = params.prefix_len + params.base_tail.len() as u32 - bytes_removed;
+
+        let gpu_params = DigestNthParamsGpu {
+            midstate: params.midstate,
+            total_preimage_len,
+            base_tail_len: params.base_tail.len() as u32,
+            dummy_push_len: params.dummy_push_len,
+            t,
+            n,
+            easy_mode: if easy_mode { 1 } else { 0 },
+            binom_stride: binom_stride as u32,
+            start_index_lo: (start_index & 0xFFFFFFFF) as u32,
+            start_index_hi: (start_index >> 32) as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        let pipeline = self.make_pipeline("digest_search_nth");
+
+        let params_buf = self.device.new_buffer_with_data(
+            &gpu_params as *const DigestNthParamsGpu as *const _,
+            mem::size_of::<DigestNthParamsGpu>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let base_tail_buf = self.device.new_buffer_with_data(
+            params.base_tail.as_ptr() as *const _,
+            params.base_tail.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let dummy_offsets_buf = self.device.new_buffer_with_data(
+            params.dummy_offsets.as_ptr() as *const _,
+            (params.dummy_offsets.len() * mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let binom_buf = self.device.new_buffer_with_data(
+            binom_table.as_ptr() as *const _,
+            (binom_table.len() * mem::size_of::<u64>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let neg_r_inv_buf = self.device.new_buffer_with_data(
+            params.neg_r_inv.as_ptr() as *const _, 32,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let mut u2r_data = [0u8; 64];
+        u2r_data[..32].copy_from_slice(&params.u2r_x);
+        u2r_data[32..].copy_from_slice(&params.u2r_y);
+        let u2r_buf = self.device.new_buffer_with_data(
+            u2r_data.as_ptr() as *const _, 64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let hit_count_buf = self.device.new_buffer(
+            mem::size_of::<u32>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe { *(hit_count_buf.contents() as *mut u32) = 0; }
+        let hit_indices_buf = self.device.new_buffer(
+            (MAX_HITS * mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(&base_tail_buf), 0);
+        encoder.set_buffer(2, Some(&dummy_offsets_buf), 0);
+        encoder.set_buffer(3, Some(&binom_buf), 0);
+        encoder.set_buffer(4, Some(&neg_r_inv_buf), 0);
+        encoder.set_buffer(5, Some(&u2r_buf), 0);
+        encoder.set_buffer(6, Some(&self.gtable_x_buf), 0);
+        encoder.set_buffer(7, Some(&self.gtable_y_buf), 0);
+        encoder.set_buffer(8, Some(&hit_count_buf), 0);
+        encoder.set_buffer(9, Some(&hit_indices_buf), 0);
+
+        let tg = THREADS_PER_GROUP.min(pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_threads(
+            MTLSize::new(num_candidates as u64, 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        let count = unsafe { *(hit_count_buf.contents() as *const u32) };
+        let count = (count as usize).min(MAX_HITS);
+        let mut hits = Vec::with_capacity(count);
+        let indices_ptr = hit_indices_buf.contents() as *const u32;
+        for i in 0..count {
+            hits.push(unsafe { *indices_ptr.add(i) });
+        }
+        hits
+    }
+
     /// Get the Metal device.
     pub fn device(&self) -> &Device {
         &self.device

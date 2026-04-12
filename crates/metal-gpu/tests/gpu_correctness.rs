@@ -1139,3 +1139,95 @@ fn gpu_digest_search_round1_config_a() {
         cpu_hits.len(), cpu_hits.len(), batch_size
     );
 }
+
+#[test]
+fn gpu_digest_search_nth_matches_precomputed() {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let m = miner();
+    let config = script::QsbConfig::config_a();
+    let pin_nonce = hors::NonceSig::derive("nth_pin");
+    let round1_nonce = hors::NonceSig::derive("nth_r1");
+    let round2_nonce = hors::NonceSig::derive("nth_r2");
+
+    let mut rng = ChaCha8Rng::seed_from_u64(55);
+    let hors1 = hors::HorsKeys::generate(config.n, &mut rng);
+    let hors2 = hors::HorsKeys::generate(config.n, &mut rng);
+    let dummy1 = hors::generate_dummy_sigs(config.n, 0);
+    let dummy2 = hors::generate_dummy_sigs(config.n, 1);
+
+    let full_script = script::build_full_script(
+        config,
+        &pin_nonce.der_encoded,
+        &round1_nonce.der_encoded,
+        &round2_nonce.der_encoded,
+        &[hors1.commitments, hors2.commitments],
+        &[dummy1, dummy2.clone()],
+    );
+
+    let mut tx = tx::Transaction::new(2, 0);
+    tx.add_input(tx::TxIn {
+        txid: [0x33; 32],
+        vout: 0,
+        script_sig: Vec::new(),
+        sequence: 0xFFFFFFFE,
+    });
+    tx.add_output(tx::TxOut {
+        value: 50_000,
+        script_pubkey: vec![
+            0x76, 0xa9, 0x14,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x88, 0xac,
+        ],
+    });
+
+    let t = config.t2_total();
+    let n = config.n;
+    let dummy2_vecs: Vec<Vec<u8>> = dummy2.iter().map(|d| d.to_vec()).collect();
+    let params = GpuDigestSearchParams::from_digest_search(
+        round2_nonce.parsed(),
+        &round2_nonce.der_encoded,
+        &dummy2_vecs,
+        &tx,
+        &full_script,
+        0,
+        t,
+    );
+
+    let batch_size: u32 = 4096;
+    let start_index: u64 = 10_000_000; // arbitrary offset into the C(150,9) space
+
+    // Build precomputed subsets for the SAME range (starting at start_index)
+    let precomputed: Vec<u32> = (0..batch_size as u64)
+        .flat_map(|i| {
+            let combo = subset::nth_combination(n, t, (start_index + i) as u128).expect("valid");
+            combo.into_iter().map(|v| v as u32).collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Precomputed-subset kernel
+    let hits_precomputed = m.search_digest_batch(
+        &params, &precomputed, t as u32, n as u32, batch_size, true,
+    );
+
+    // nth_combination kernel
+    let hits_nth = m.search_digest_batch_nth(
+        &params, t as u32, n as u32, start_index, batch_size, true,
+    );
+
+    let mut a = hits_precomputed.clone();
+    a.sort();
+    let mut b = hits_nth.clone();
+    b.sort();
+
+    assert_eq!(
+        a, b,
+        "nth_combination kernel must match precomputed: {} vs {} hits",
+        a.len(), b.len()
+    );
+    println!(
+        "nth_combination parity: {}/{} hits match over {} subsets",
+        b.len(), a.len(), batch_size
+    );
+}

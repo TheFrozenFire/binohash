@@ -9,6 +9,7 @@ hash = { path = "../hash" }
 ecdsa-recovery = { path = "../ecdsa-recovery" }
 puzzle = { path = "../puzzle" }
 script = { path = "../script" }
+subset = { path = "../subset" }
 tx = { path = "../tx" }
 hors = { path = "../hors" }
 thiserror = "2"
